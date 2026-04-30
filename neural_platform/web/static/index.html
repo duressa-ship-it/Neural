@@ -1,0 +1,997 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NeuralForge</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+
+<aside class="sidebar">
+  <div class="brand">
+    <div class="brand-mark">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"/></svg>
+    </div>
+    <div>
+      <div class="brand-text">NeuralForge</div>
+      <div class="brand-sub">Training Platform</div>
+    </div>
+  </div>
+
+  <div class="nav-section">Workflow</div>
+  <nav>
+    <div class="nav-item active" data-page="overview">
+      <span class="nav-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></span>
+      Overview
+    </div>
+    <div class="nav-item" data-page="train">
+      <span class="nav-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5,3 19,12 5,21"/></svg></span>
+      Train
+    </div>
+    <div class="nav-item" data-page="live">
+      <span class="nav-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h4l3-9 4 18 3-9h4"/></svg></span>
+      Live
+      <span class="nav-pulse hidden" id="nav-live-pulse"></span>
+    </div>
+    <div class="nav-item" data-page="builder">
+      <span class="nav-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg></span>
+      Builder
+    </div>
+
+    <div class="nav-section">Library</div>
+    <div class="nav-item" data-page="experiments">
+      <span class="nav-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 2v6L4 18a4 4 0 0 0 4 4h8a4 4 0 0 0 4-4l-6-10V2"/><line x1="9" y1="2" x2="15" y2="2"/></svg></span>
+      Experiments
+      <span class="nav-badge" id="nav-exp-count">0</span>
+    </div>
+    <div class="nav-item" data-page="curves">
+      <span class="nav-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 17 9 11 13 15 21 7"/></svg></span>
+      Curves
+    </div>
+    <div class="nav-item" data-page="checkpoints">
+      <span class="nav-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="6" width="20" height="14" rx="2"/><path d="M2 10h20"/><path d="M7 6V4a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v2"/></svg></span>
+      Checkpoints
+      <span class="nav-badge" id="nav-ckpt-count">0</span>
+    </div>
+    <div class="nav-item" data-page="predict">
+      <span class="nav-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="9" opacity=".3"/><path d="M12 3v3M12 18v3M21 12h-3M6 12H3"/></svg></span>
+      Predict
+    </div>
+
+    <div class="nav-section">System</div>
+    <div class="nav-item" data-page="cli">
+      <span class="nav-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg></span>
+      CLI Reference
+    </div>
+    <div class="nav-item" data-page="settings">
+      <span class="nav-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span>
+      Settings
+    </div>
+  </nav>
+
+  <div class="sidebar-foot">
+    <div class="health-row"><span class="dot online" id="sb-dot-api"></span><span class="text-xs">API</span><span class="text-xs text-muted" style="margin-left:auto" id="sb-uptime">—</span></div>
+    <div class="health-row"><span class="dot" id="sb-dot-train"></span><span class="text-xs" id="sb-train-text">Idle</span></div>
+  </div>
+</aside>
+
+<div class="topbar">
+  <div class="crumb">
+    <span class="text-faint">NeuralForge</span>
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
+    <span class="crumb-current" id="crumb-page">Overview</span>
+  </div>
+  <div class="topbar-spacer"></div>
+  <div class="topbar-status"><span class="dot online" id="ts-dot"></span><span id="ts-text">Healthy</span></div>
+  <button class="topbar-btn" onclick="openPalette()">
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><line x1="20" y1="20" x2="16.65" y2="16.65"/></svg>
+    Search
+    <kbd>⌘K</kbd>
+  </button>
+  <button class="topbar-btn" onclick="refreshAll()" title="Refresh data (r)">
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+  </button>
+  <button class="topbar-btn" onclick="toast(shortcutHelp(), 'info', 8000)" title="Keyboard shortcuts (?)">
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+  </button>
+</div>
+
+<main class="main">
+
+<!-- ── Overview ── -->
+<section class="page active" id="page-overview">
+  <div class="page-h">
+    <div>
+      <h1 class="page-title">Welcome back</h1>
+      <p class="page-sub">Your model lab at a glance — start runs, watch curves, ship checkpoints.</p>
+    </div>
+    <div class="row">
+      <button class="btn btn-secondary" onclick="navigate('builder')">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+        New experiment
+      </button>
+      <button class="btn btn-primary" onclick="navigate('train')">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5,3 19,12 5,21"/></svg>
+        Train a model
+      </button>
+    </div>
+  </div>
+
+  <div class="system-strip" id="system-strip"></div>
+
+  <div class="kpi-row">
+    <div class="stat" style="--accent-bar: var(--primary)">
+      <div class="stat-bar"></div>
+      <div class="stat-label">Experiments</div>
+      <div class="stat-value" id="kpi-total">—</div>
+      <div class="stat-meta" id="kpi-total-meta">All time</div>
+    </div>
+    <div class="stat" style="--accent-bar: var(--success)">
+      <div class="stat-bar"></div>
+      <div class="stat-label">Completed</div>
+      <div class="stat-value" id="kpi-done">—</div>
+      <div class="stat-meta" id="kpi-done-meta">—</div>
+    </div>
+    <div class="stat" style="--accent-bar: var(--warning)">
+      <div class="stat-bar"></div>
+      <div class="stat-label">Running</div>
+      <div class="stat-value" id="kpi-run">—</div>
+      <div class="stat-meta" id="kpi-run-meta">Active subprocess: —</div>
+    </div>
+    <div class="stat" style="--accent-bar: var(--accent)">
+      <div class="stat-bar"></div>
+      <div class="stat-label">Checkpoints</div>
+      <div class="stat-value" id="kpi-ckpt">—</div>
+      <div class="stat-meta" id="kpi-ckpt-meta">— MB on disk</div>
+    </div>
+  </div>
+
+  <div class="grid grid-2-1">
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <div class="card-title">Recent experiments</div>
+          <div class="card-sub">Latest 6 runs across this workspace</div>
+        </div>
+        <button class="btn btn-ghost btn-sm" onclick="navigate('experiments')">View all →</button>
+      </div>
+      <div id="ov-recent" class="table-wrap"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <div class="card-title">Best val loss</div>
+          <div class="card-sub">Top 8</div>
+        </div>
+      </div>
+      <div class="chart-wrap"><canvas id="ov-chart"></canvas></div>
+    </div>
+  </div>
+
+  <div class="grid grid-2 mt-4">
+    <div class="card">
+      <div class="card-head">
+        <div class="card-title">Recent checkpoints</div>
+        <button class="btn btn-ghost btn-sm" onclick="navigate('checkpoints')">All →</button>
+      </div>
+      <div id="ov-ckpts"></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><div class="card-title">Quick actions</div></div>
+      <div class="grid grid-2" style="gap:10px">
+        <button class="btn btn-secondary" style="justify-content:flex-start;padding:14px" onclick="navigate('train')">
+          <div style="text-align:left">
+            <div style="font-weight:600">▶ Launch training</div>
+            <div class="text-xs text-muted mt-2" style="font-weight:400">Pick a config, override params, go.</div>
+          </div>
+        </button>
+        <button class="btn btn-secondary" style="justify-content:flex-start;padding:14px" onclick="navigate('builder')">
+          <div style="text-align:left">
+            <div style="font-weight:600">⚙ Build a model</div>
+            <div class="text-xs text-muted mt-2" style="font-weight:400">Visual config builder for all model families.</div>
+          </div>
+        </button>
+        <button class="btn btn-secondary" style="justify-content:flex-start;padding:14px" onclick="navigate('predict')">
+          <div style="text-align:left">
+            <div style="font-weight:600">🔮 Predict</div>
+            <div class="text-xs text-muted mt-2" style="font-weight:400">Connect to a server, test live inference.</div>
+          </div>
+        </button>
+        <button class="btn btn-secondary" style="justify-content:flex-start;padding:14px" onclick="navigate('curves')">
+          <div style="text-align:left">
+            <div style="font-weight:600">📈 Compare curves</div>
+            <div class="text-xs text-muted mt-2" style="font-weight:400">Train vs val across experiments.</div>
+          </div>
+        </button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Train ── -->
+<section class="page" id="page-train">
+  <div class="page-h">
+    <div>
+      <h1 class="page-title">Train</h1>
+      <p class="page-sub">Choose a config, optionally override hyperparameters, and start a training subprocess.</p>
+    </div>
+    <div class="topbar-status"><span class="dot" id="train-status-dot"></span><span id="train-status-text">Idle</span></div>
+  </div>
+
+  <div class="grid grid-2-1">
+    <div>
+      <div class="card mb-3">
+        <div class="card-head">
+          <div class="card-title">Experiment config</div>
+          <button class="btn btn-ghost btn-sm" onclick="loadConfigs()">↻ Refresh</button>
+        </div>
+
+        <div class="field">
+          <label class="label">Select a config</label>
+          <select class="select" id="cfg-select" onchange="onConfigChange()">
+            <option value="">— pick a config —</option>
+          </select>
+        </div>
+
+        <div id="cfg-chips" class="hidden mb-3"></div>
+
+        <div class="field">
+          <label class="label">Or path directly</label>
+          <input class="input input-mono" id="cfg-path" type="text" placeholder="runs/my_experiment/config.yaml" oninput="onPathInput()" />
+        </div>
+
+        <div class="card-head" style="margin-top:18px">
+          <div>
+            <div class="card-title">Parameter overrides</div>
+            <div class="card-sub text-xs">Tweak training values without editing the YAML</div>
+          </div>
+          <button class="btn btn-ghost btn-sm" onclick="addOverride()">+ Add</button>
+        </div>
+        <div id="ov-list"></div>
+
+        <div class="row-tight mt-3">
+          <button class="btn btn-secondary btn-xs" onclick="addOverride('training.num_epochs=')">epochs</button>
+          <button class="btn btn-secondary btn-xs" onclick="addOverride('training.optimizer.lr=')">lr</button>
+          <button class="btn btn-secondary btn-xs" onclick="addOverride('training.batch_size=')">batch_size</button>
+          <button class="btn btn-secondary btn-xs" onclick="addOverride('training.device=cpu')">force cpu</button>
+          <button class="btn btn-secondary btn-xs" onclick="addOverride('training.mixed_precision=true')">amp</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><div class="card-title">No config yet?</div></div>
+        <p class="text-xs text-muted mb-3">Use the visual <a href="#" onclick="navigate('builder');return false;" style="color:var(--primary)">Builder</a> or scaffold from terminal:</p>
+        <div class="code-block">neural init --model mlp --name my_exp
+neural init --model cnn --name image_classifier
+neural init --model transformer --name text_classifier</div>
+      </div>
+    </div>
+
+    <div>
+      <div class="card mb-3">
+        <div class="card-title">Run control</div>
+        <div class="row mt-3">
+          <button class="btn btn-primary" id="train-start" onclick="startTraining()" disabled>
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5,3 19,12 5,21"/></svg>
+            Start training
+          </button>
+          <button class="btn btn-danger" id="train-stop" onclick="stopTraining()" disabled>
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="6" y="6" width="12" height="12"/></svg>
+            Stop
+          </button>
+          <button class="btn btn-ghost btn-sm" onclick="navigate('live')">Live view →</button>
+        </div>
+        <div id="train-proc-info" class="hidden mt-4">
+          <div class="text-xs text-muted mb-2">PID <span class="text-mono" style="color:var(--fg)" id="train-pid">—</span></div>
+          <div class="code-block text-xs" id="train-cmd" style="font-size:11.5px">—</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <div class="card-title">Subprocess output</div>
+            <div class="card-sub">Live tail of stdout/stderr</div>
+          </div>
+          <button class="btn btn-ghost btn-sm" onclick="refreshTrainLogs()">↻</button>
+        </div>
+        <div id="train-log" class="log-pane" style="white-space:pre-wrap">Subprocess output will appear here after training starts…</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Live ── -->
+<section class="page" id="page-live">
+  <div class="page-h">
+    <div>
+      <h1 class="page-title">Live training</h1>
+      <p class="page-sub">Real-time metrics streamed from the active subprocess.</p>
+    </div>
+    <div class="row">
+      <div class="topbar-status"><span class="dot" id="live-dot"></span><span id="live-text">Disconnected</span></div>
+      <button class="btn btn-secondary btn-sm" onclick="connectLive()">Reconnect</button>
+      <button class="btn btn-danger btn-sm hidden" id="live-stop-btn" onclick="stopFromLive()">Stop training</button>
+    </div>
+  </div>
+
+  <div class="system-strip" id="live-system-strip"></div>
+
+  <div id="live-header" class="hidden">
+    <div class="grid grid-6 mb-4">
+      <div class="stat" style="--accent-bar:var(--primary)"><div class="stat-bar"></div><div class="stat-label">Experiment</div><div class="stat-value text-md truncate" id="lv-name" style="font-size:14px;font-weight:600">—</div><div class="stat-meta" id="lv-model">—</div></div>
+      <div class="stat" style="--accent-bar:var(--accent)"><div class="stat-bar"></div><div class="stat-label">Epoch</div><div class="stat-value" id="lv-epoch">—</div><div class="stat-meta" id="lv-epoch-meta">—</div></div>
+      <div class="stat" style="--accent-bar:var(--primary)"><div class="stat-bar"></div><div class="stat-label">Train loss</div><div class="stat-value" id="lv-tl">—</div></div>
+      <div class="stat" style="--accent-bar:var(--success)"><div class="stat-bar"></div><div class="stat-label">Val loss</div><div class="stat-value" id="lv-vl">—</div></div>
+      <div class="stat" style="--accent-bar:var(--warning)"><div class="stat-bar"></div><div class="stat-label">Accuracy</div><div class="stat-value" id="lv-acc">—</div></div>
+      <div class="stat" style="--accent-bar:var(--accent)"><div class="stat-bar"></div><div class="stat-label">Learning rate</div><div class="stat-value" id="lv-lr" style="font-size:18px">—</div></div>
+    </div>
+
+    <div class="card mb-4">
+      <div class="between mb-2 text-xs text-muted"><span>Epoch progress</span><span id="lv-ep-pct">0%</span></div>
+      <div class="pbar mb-3"><div class="pbar-fill" id="lv-ep-bar" style="width:0"></div></div>
+      <div class="between mb-2 text-xs text-muted"><span>Batch progress</span><span id="lv-bt-pct">0%</span></div>
+      <div class="pbar pbar-thin"><div class="pbar-fill" id="lv-bt-bar" style="width:0;background:var(--accent)"></div></div>
+      <div class="row-tight mt-3 text-xs text-muted">
+        <span>Batch <span class="text-mono" style="color:var(--fg)" id="lv-bt-num">—</span></span>
+        <span>Elapsed <span class="text-mono" style="color:var(--fg)" id="lv-elapsed">—</span></span>
+        <span>Device <span class="text-mono" style="color:var(--fg)" id="lv-dev">—</span></span>
+        <span>ETA <span class="text-mono" style="color:var(--fg)" id="lv-eta">—</span></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid grid-2 mb-4">
+    <div class="card"><div class="card-head"><div class="card-title">Batch loss</div><span class="pill text-xs" id="lv-batch-stat">—</span></div><div class="chart-wrap"><canvas id="ch-batch"></canvas></div></div>
+    <div class="card"><div class="card-head"><div class="card-title">Train vs val (epoch)</div></div><div class="chart-wrap"><canvas id="ch-epoch"></canvas></div></div>
+  </div>
+
+  <div class="grid grid-2">
+    <div class="card"><div class="card-head"><div class="card-title">Accuracy (epoch)</div></div><div class="chart-wrap"><canvas id="ch-acc"></canvas></div></div>
+    <div class="card"><div class="card-head"><div class="card-title">Event log</div></div><div id="live-log" class="log-pane"></div></div>
+  </div>
+
+  <div id="live-empty" class="card mt-4 empty">
+    <div class="empty-icon">📡</div>
+    <div style="font-size:15px;color:var(--fg);margin-bottom:6px">Waiting for a training run</div>
+    <div class="text-xs text-muted">Start one from the Train page or via CLI</div>
+    <div class="code-block mt-4" style="display:inline-block;text-align:left">neural train --config runs/my_experiment/config.yaml</div>
+  </div>
+</section>
+
+<!-- ── Builder ── -->
+<section class="page" id="page-builder">
+  <div class="page-h">
+    <div>
+      <h1 class="page-title">Visual builder</h1>
+      <p class="page-sub">Compose a config without YAML. Pick a model family, fill in fields, save & train.</p>
+    </div>
+  </div>
+
+  <div class="grid grid-1-2">
+    <div>
+      <div class="card mb-3">
+        <div class="card-title mb-3">1. Identity</div>
+        <div class="field"><label class="label">Experiment name</label><input class="input" id="b-name" type="text" placeholder="my_experiment" /></div>
+        <div class="field"><label class="label">Description</label><textarea class="input" id="b-desc" placeholder="What's this run about?" style="min-height:48px;font-family:var(--font-sans)"></textarea></div>
+        <div class="field"><label class="label">Tags (comma-separated)</label><input class="input" id="b-tags" type="text" placeholder="cv, baseline" /></div>
+      </div>
+
+      <div class="card mb-3">
+        <div class="card-title mb-3">2. Task</div>
+        <div class="text-xs text-muted mb-3">
+          What does this model do? Pick from the HuggingFace task taxonomy.
+          Architecture suggestions on the next step adapt to your choice.
+        </div>
+        <div class="field">
+          <label class="label">Task family</label>
+          <select class="select" id="b-task-group" onchange="bRenderTaskList()"></select>
+        </div>
+        <div class="field">
+          <label class="label">Task</label>
+          <select class="select" id="b-task" onchange="bTaskChanged()">
+            <option value="">— select a task —</option>
+          </select>
+        </div>
+        <div id="b-task-meta" class="text-xs text-muted hidden" style="background:var(--surface-2);border:1px solid var(--border);border-radius:6px;padding:10px;line-height:1.6"></div>
+      </div>
+
+      <div class="card mb-3">
+        <div class="card-title mb-3">3. Architecture</div>
+        <div class="field">
+          <label class="label">Model family</label>
+          <div class="tabs" id="b-mtype-tabs" style="flex-wrap:wrap">
+            <div class="tab active" data-mtype="mlp">MLP</div>
+            <div class="tab" data-mtype="cnn">CNN</div>
+            <div class="tab" data-mtype="rnn">RNN/LSTM</div>
+            <div class="tab" data-mtype="transformer">Transformer</div>
+            <div class="tab" data-mtype="audio_cnn">Audio</div>
+            <div class="tab" data-mtype="tcn">TCN</div>
+            <div class="tab" data-mtype="tabular">Tabular</div>
+            <div class="tab" data-mtype="video_cnn">Video<span class="badge b-warning text-xs" style="margin-left:6px;padding:0 5px;font-size:9px">exp</span></div>
+            <div class="tab" data-mtype="hf_pipeline">HF Wrapper<span class="badge b-accent text-xs" style="margin-left:6px;padding:0 5px;font-size:9px">universal</span></div>
+          </div>
+        </div>
+
+        <div id="b-mlp">
+          <div class="grid grid-2 mb-3">
+            <div><label class="label">Input size</label><input class="input" id="b-mlp-in" type="number" value="20" /></div>
+            <div><label class="label">Output size</label><input class="input" id="b-mlp-out" type="number" value="2" /></div>
+          </div>
+          <div class="label">Hidden layers</div>
+          <div id="b-mlp-layers"></div>
+          <button class="btn btn-secondary btn-xs mt-2" onclick="bAddMlpLayer()">+ Layer</button>
+        </div>
+
+        <div id="b-cnn" class="hidden">
+          <div class="grid grid-3 mb-3">
+            <div><label class="label">Channels</label><input class="input" id="b-cnn-c" type="number" value="3" /></div>
+            <div><label class="label">Height</label><input class="input" id="b-cnn-h" type="number" value="224" /></div>
+            <div><label class="label">Width</label><input class="input" id="b-cnn-w" type="number" value="224" /></div>
+          </div>
+          <div class="field">
+            <label class="label">Backbone (optional)</label>
+            <select class="select" id="b-cnn-bb">
+              <option value="">— custom layers —</option>
+              <option value="resnet18">resnet18</option>
+              <option value="resnet50">resnet50</option>
+              <option value="vgg16">vgg16</option>
+              <option value="efficientnet_b0">efficientnet_b0</option>
+            </select>
+          </div>
+          <div class="field"><label class="label">Output classes</label><input class="input" id="b-cnn-out" type="number" value="10" /></div>
+        </div>
+
+        <div id="b-rnn" class="hidden">
+          <div class="grid grid-3 mb-3">
+            <div><label class="label">Variant</label>
+              <select class="select" id="b-rnn-var">
+                <option value="lstm">LSTM</option><option value="gru">GRU</option><option value="rnn">RNN</option>
+              </select>
+            </div>
+            <div><label class="label">Input size</label><input class="input" id="b-rnn-in" type="number" value="64" /></div>
+            <div><label class="label">Hidden size</label><input class="input" id="b-rnn-h" type="number" value="256" /></div>
+          </div>
+          <div class="grid grid-3 mb-3">
+            <div><label class="label">Layers</label><input class="input" id="b-rnn-l" type="number" value="2" /></div>
+            <div><label class="label">Dropout</label><input class="input" id="b-rnn-d" type="number" step="0.05" value="0.1" /></div>
+            <div><label class="label">Output size</label><input class="input" id="b-rnn-out" type="number" value="5" /></div>
+          </div>
+          <label class="text-sm row-tight"><input type="checkbox" id="b-rnn-bi" /> Bidirectional</label>
+        </div>
+
+        <div id="b-tx" class="hidden">
+          <div class="grid grid-2 mb-3">
+            <div><label class="label">Vocab size</label><input class="input" id="b-tx-vocab" type="number" value="30522" /></div>
+            <div><label class="label">Max seq len</label><input class="input" id="b-tx-seq" type="number" value="512" /></div>
+          </div>
+          <div class="grid grid-3 mb-3">
+            <div><label class="label">d_model</label><input class="input" id="b-tx-d" type="number" value="256" /></div>
+            <div><label class="label">Heads</label><input class="input" id="b-tx-h" type="number" value="8" /></div>
+            <div><label class="label">Layers</label><input class="input" id="b-tx-l" type="number" value="6" /></div>
+          </div>
+          <div class="grid grid-2">
+            <div><label class="label">d_ff</label><input class="input" id="b-tx-ff" type="number" value="1024" /></div>
+            <div><label class="label">Output classes</label><input class="input" id="b-tx-out" type="number" value="2" /></div>
+          </div>
+        </div>
+
+        <!-- AUDIO_CNN -->
+        <div id="b-audio" class="hidden">
+          <div class="grid grid-3 mb-3">
+            <div><label class="label">Sample rate</label><input class="input" id="b-aud-sr" type="number" value="16000" /></div>
+            <div><label class="label">Duration (s)</label><input class="input" id="b-aud-dur" type="number" step="0.1" value="1.0" /></div>
+            <div><label class="label">Output classes</label><input class="input" id="b-aud-out" type="number" value="35" /></div>
+          </div>
+          <div class="grid grid-3 mb-3">
+            <div><label class="label">n_mels</label><input class="input" id="b-aud-mels" type="number" value="64" /></div>
+            <div><label class="label">n_fft</label><input class="input" id="b-aud-fft" type="number" value="1024" /></div>
+            <div><label class="label">Hop length</label><input class="input" id="b-aud-hop" type="number" value="256" /></div>
+          </div>
+          <label class="text-sm row-tight" style="margin-bottom:8px">
+            <input type="checkbox" id="b-aud-spec" checked /> Use mel-spectrogram (2D conv path)
+          </label>
+          <div class="field">
+            <label class="label">Pretrained encoder (optional)</label>
+            <input class="input input-mono" id="b-aud-pre" placeholder="facebook/wav2vec2-base (leave empty for from-scratch)" />
+          </div>
+        </div>
+
+        <!-- TCN -->
+        <div id="b-tcn" class="hidden">
+          <div class="grid grid-3 mb-3">
+            <div><label class="label">Input size</label><input class="input" id="b-tcn-in" type="number" value="1" /></div>
+            <div><label class="label">Output size</label><input class="input" id="b-tcn-out" type="number" value="4" /></div>
+            <div><label class="label">Kernel size</label><input class="input" id="b-tcn-k" type="number" value="3" /></div>
+          </div>
+          <div class="grid grid-3 mb-3">
+            <div><label class="label">Channels (csv)</label><input class="input input-mono" id="b-tcn-ch" value="64,64,64,64" /></div>
+            <div><label class="label">Dropout</label><input class="input" id="b-tcn-drop" type="number" step="0.05" value="0.1" /></div>
+            <div><label class="label">Output mode</label>
+              <select class="select" id="b-tcn-mode">
+                <option value="last">last</option>
+                <option value="mean">mean</option>
+                <option value="max">max</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tabular -->
+        <div id="b-tab" class="hidden">
+          <div class="field">
+            <label class="label">Numeric features (comma-separated)</label>
+            <input class="input input-mono" id="b-tab-num" placeholder="age, income, balance" />
+          </div>
+          <div class="field">
+            <label class="label">Categorical features — one per line, format: <code>name:cardinality[:embed_dim]</code></label>
+            <textarea class="input" id="b-tab-cat" placeholder="country:200&#10;plan:5:4&#10;device:25:8" style="font-family:var(--font-mono);min-height:90px"></textarea>
+          </div>
+          <div class="grid grid-2">
+            <div><label class="label">Output size</label><input class="input" id="b-tab-out" type="number" value="2" /></div>
+            <div><label class="label">Impute strategy</label>
+              <select class="select" id="b-tab-imp">
+                <option value="mean">mean</option><option value="median">median</option><option value="zero">zero</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <!-- Video CNN -->
+        <div id="b-vid" class="hidden">
+          <div class="text-xs text-muted mb-3" style="background:var(--warning-bg);padding:8px 10px;border-radius:6px">
+            <strong style="color:var(--warning)">Experimental</strong> — basic 3D CNN baseline. Production video work needs purpose-built architectures (I3D, SlowFast, MViT) coming later.
+          </div>
+          <div class="grid grid-3 mb-3">
+            <div><label class="label">Channels</label><input class="input" id="b-vid-c" type="number" value="3" /></div>
+            <div><label class="label">Frames</label><input class="input" id="b-vid-t" type="number" value="16" /></div>
+            <div><label class="label">Output classes</label><input class="input" id="b-vid-out" type="number" value="10" /></div>
+          </div>
+          <div class="grid grid-2">
+            <div><label class="label">Height</label><input class="input" id="b-vid-h" type="number" value="112" /></div>
+            <div><label class="label">Width</label><input class="input" id="b-vid-w" type="number" value="112" /></div>
+          </div>
+        </div>
+
+        <!-- HF Pipeline wrapper -->
+        <div id="b-hf" class="hidden">
+          <div class="text-xs text-muted mb-3" style="background:var(--accent-bg);padding:8px 10px;border-radius:6px">
+            <strong style="color:var(--accent)">Universal HF wrapper</strong> — fine-tune any HuggingFace model
+            for the chosen task. Supports ASR, summarization, image segmentation,
+            visual-question-answering, and most other HF pipeline tags.
+          </div>
+          <div class="field">
+            <label class="label">Pretrained model id</label>
+            <input class="input input-mono" id="b-hf-pretrained" placeholder="openai/whisper-tiny" />
+            <div class="text-xs text-faint mt-2">e.g. <code>facebook/wav2vec2-base</code>, <code>google/vit-base-patch16-224</code>, <code>bert-base-uncased</code></div>
+          </div>
+          <div class="grid grid-2">
+            <div><label class="label">Output classes (optional)</label><input class="input" id="b-hf-output" type="number" placeholder="auto" /></div>
+            <div><label class="label">Freeze backbone</label>
+              <select class="select" id="b-hf-freeze">
+                <option value="false">no — full fine-tune</option>
+                <option value="true">yes — train head only</option>
+              </select>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card mb-3">
+        <div class="card-title mb-3">4. Training</div>
+        <div class="grid grid-3 mb-3">
+          <div><label class="label">Epochs</label><input class="input" id="b-epochs" type="number" value="50" /></div>
+          <div><label class="label">Batch size</label><input class="input" id="b-bs" type="number" value="32" /></div>
+          <div><label class="label">Learning rate</label><input class="input" id="b-lr" type="number" step="0.0001" value="0.001" /></div>
+        </div>
+        <div class="grid grid-3">
+          <div><label class="label">Optimizer</label>
+            <select class="select" id="b-opt"><option>adamw</option><option>adam</option><option>sgd</option><option>rmsprop</option></select>
+          </div>
+          <div><label class="label">Scheduler</label>
+            <select class="select" id="b-sched"><option>cosine</option><option>warmup_cosine</option><option>step</option><option>plateau</option><option>none</option></select>
+          </div>
+          <div><label class="label">Device</label>
+            <select class="select" id="b-dev"><option>auto</option><option>cpu</option><option>cuda</option><option>mps</option></select>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title mb-3">5. Data</div>
+        <div class="field">
+          <label class="label">Source</label>
+          <select class="select" id="b-data-source" onchange="bDataChange()">
+            <option value="synthetic">synthetic (test data)</option>
+            <option value="csv">csv</option>
+            <option value="image_folder">image_folder</option>
+            <option value="huggingface">huggingface</option>
+            <option value="numpy">numpy</option>
+          </select>
+        </div>
+        <div id="b-data-extra"></div>
+        <div class="grid grid-2">
+          <div><label class="label">Val split</label><input class="input" id="b-val-split" type="number" step="0.05" value="0.2" /></div>
+          <div><label class="label">Test split</label><input class="input" id="b-test-split" type="number" step="0.05" value="0" /></div>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <div class="card mb-3" style="position:sticky;top:calc(var(--topbar-h) + 16px)">
+        <div class="card-head">
+          <div class="card-title">Generated config</div>
+          <button class="btn btn-ghost btn-sm" onclick="copyText(document.getElementById('b-yaml').textContent, 'YAML copied')">Copy YAML</button>
+        </div>
+        <div class="code-block" id="b-yaml" style="max-height:520px;overflow:auto">—</div>
+
+        <div class="row mt-4" style="gap:8px;flex-wrap:wrap">
+          <button class="btn btn-primary" onclick="bSave(false)">Save config</button>
+          <button class="btn btn-secondary" onclick="bSave(true)">Save & open Train →</button>
+          <button class="btn btn-ghost" onclick="bReset()">Reset</button>
+        </div>
+        <div class="text-xs text-muted mt-3">Saves to <span class="text-mono" style="color:var(--fg)">runs/&lt;name&gt;/config.yaml</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Experiments ── -->
+<section class="page" id="page-experiments">
+  <div class="page-h">
+    <div>
+      <h1 class="page-title">Experiments</h1>
+      <p class="page-sub">Browse all tracked runs. Click for full metrics &amp; runs.</p>
+    </div>
+    <div class="row">
+      <button class="btn btn-secondary btn-sm" onclick="cleanupStale()">Clean up stale runs</button>
+    </div>
+  </div>
+
+  <div class="card mb-3 row" style="padding:12px 14px">
+    <input class="input" id="exp-search" type="text" placeholder="Search by name or description…" style="max-width:320px" oninput="renderExpTable()" />
+    <select class="select" id="exp-status" style="max-width:180px" onchange="renderExpTable()">
+      <option value="">All statuses</option>
+      <option value="completed">Completed</option>
+      <option value="running">Running</option>
+      <option value="interrupted">Interrupted</option>
+      <option value="failed">Failed</option>
+    </select>
+    <span class="text-xs text-muted" id="exp-count"></span>
+  </div>
+
+  <div class="card">
+    <div class="table-wrap">
+      <table id="exp-table">
+        <thead>
+          <tr>
+            <th class="sortable" data-sort="id">#</th>
+            <th class="sortable" data-sort="name">Name</th>
+            <th>Status</th>
+            <th class="sortable" data-sort="best_val_loss">Best val loss</th>
+            <th class="sortable" data-sort="created_at">Created</th>
+            <th>Tags</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="exp-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ── Curves ── -->
+<section class="page" id="page-curves">
+  <div class="page-h"><div><h1 class="page-title">Training curves</h1><p class="page-sub">Per-epoch metrics — pick an experiment and a metric.</p></div></div>
+
+  <div class="card mb-3">
+    <div class="row">
+      <div style="min-width:240px"><label class="label">Experiment</label><select class="select" id="cv-exp" onchange="loadCurves()"></select></div>
+      <div style="min-width:160px"><label class="label">Metric</label>
+        <select class="select" id="cv-metric" onchange="renderCurves()">
+          <option value="loss">Loss</option><option value="accuracy">Accuracy</option>
+          <option value="mse">MSE</option><option value="rmse">RMSE</option><option value="mae">MAE</option>
+        </select>
+      </div>
+      <div style="min-width:140px"><label class="label">Y-axis</label>
+        <select class="select" id="cv-scale" onchange="renderCurves()">
+          <option value="linear">Linear</option><option value="logarithmic">Log</option>
+        </select>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid grid-2 mb-4">
+    <div class="card"><div class="card-head"><div class="card-title">Train</div></div><div class="chart-wrap"><canvas id="cv-train"></canvas></div></div>
+    <div class="card"><div class="card-head"><div class="card-title">Validation</div></div><div class="chart-wrap"><canvas id="cv-val"></canvas></div></div>
+  </div>
+  <div class="card"><div class="card-head"><div class="card-title">Combined</div></div><div class="chart-wrap chart-tall"><canvas id="cv-comb"></canvas></div></div>
+</section>
+
+<!-- ── Checkpoints ── -->
+<section class="page" id="page-checkpoints">
+  <div class="page-h"><div><h1 class="page-title">Checkpoints</h1><p class="page-sub">All saved <code>.pt</code> files.</p></div></div>
+  <div class="card">
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Experiment</th><th>File</th><th>Model</th><th>Epoch</th><th>Val loss</th><th>Size</th><th></th></tr></thead>
+        <tbody id="ck-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ── Predict ── -->
+<section class="page" id="page-predict">
+  <div class="page-h"><div><h1 class="page-title">Predict</h1><p class="page-sub">Connect to an inference server (started with <code>neural serve</code>) and run live predictions.</p></div></div>
+
+  <div class="card mb-3">
+    <div class="row">
+      <div style="flex:1;min-width:260px">
+        <label class="label">Inference server URL</label>
+        <input class="input input-mono" id="pg-url" type="text" value="http://localhost:8080" onkeydown="if(event.key==='Enter')pgConnect()" />
+      </div>
+      <div style="padding-top:18px"><button class="btn btn-primary" onclick="pgConnect()">Connect</button></div>
+      <div style="padding-top:18px" class="row-tight"><span class="dot" id="pg-dot"></span><span class="text-sm" id="pg-status">Not connected</span></div>
+      <div style="padding-top:14px">
+        <label class="label">Force input type</label>
+        <select class="select" id="pg-type-override" onchange="pgSetType(this.value, true)">
+          <option value="">Auto-detect</option>
+          <option value="mlp">MLP / Tabular</option>
+          <option value="cnn">CNN / Image</option>
+          <option value="rnn">RNN / Sequence</option>
+          <option value="transformer">Transformer / Text</option>
+        </select>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid grid-2">
+    <div>
+      <div class="card mb-3 hidden" id="pg-info-card">
+        <div class="card-title mb-3">Model</div>
+        <div class="grid grid-3" id="pg-info"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title">Input</div>
+          <div class="row-tight">
+            <label class="text-xs text-muted">Top-K</label>
+            <select class="select" id="pg-topk" style="width:64px;padding:3px 6px">
+              <option>1</option><option>3</option><option selected>5</option><option>10</option>
+            </select>
+          </div>
+        </div>
+
+        <div id="pg-mlp-input">
+          <div class="text-xs text-muted mb-2">Feature values (one per cell)</div>
+          <div class="mlp-grid" id="pg-mlp-grid"></div>
+          <div class="row-tight mt-2">
+            <button class="btn btn-secondary btn-xs" onclick="pgAddMlpField(0)">+ Field</button>
+            <button class="btn btn-ghost btn-xs" onclick="pgRandomFill()">Randomize</button>
+            <button class="btn btn-ghost btn-xs" onclick="pgClearFields()">Zero</button>
+          </div>
+        </div>
+
+        <div id="pg-cnn-input" class="hidden">
+          <div class="drop" id="pg-drop" onclick="document.getElementById('pg-file').click()">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="color:var(--fg-muted)"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+            <div class="mt-2">Drop image here or click to browse</div>
+            <div class="text-xs text-muted mt-2">PNG, JPG, GIF — auto-resized by server</div>
+            <img id="pg-img-preview" class="hidden" alt="preview" />
+          </div>
+          <input type="file" id="pg-file" accept="image/*" class="hidden" onchange="pgHandleFile(this.files[0])" />
+        </div>
+
+        <div id="pg-rnn-input" class="hidden">
+          <label class="label">Input sequence — one timestep per line, comma-separated features</label>
+          <textarea class="input" id="pg-rnn" placeholder="0.1, 0.5, 0.9&#10;0.2, 0.4, 0.8"></textarea>
+        </div>
+
+        <div id="pg-tx-input" class="hidden">
+          <label class="label">Pre-tokenized IDs (comma-separated)</label>
+          <input class="input input-mono" id="pg-tokens" placeholder="101, 2023, 2003, 1037, 102" />
+          <div class="text-xs text-muted mt-2">Most NeuralForge transformer servers expect already-tokenized inputs.</div>
+        </div>
+
+        <div class="row mt-4">
+          <button class="btn btn-primary" id="pg-run" onclick="pgRun()" disabled>
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5,3 19,12 5,21"/></svg>
+            Run prediction
+          </button>
+          <button class="btn btn-ghost" onclick="pgClearResults()">Clear</button>
+          <span class="text-xs text-muted" id="pg-latency"></span>
+        </div>
+        <div id="pg-error" class="hidden mt-3 text-xs" style="color:var(--danger)"></div>
+      </div>
+    </div>
+
+    <div>
+      <div class="card" style="min-height:240px">
+        <div class="card-head">
+          <div class="card-title">Predictions</div>
+          <button class="btn btn-ghost btn-sm" onclick="pgToggleJson()">{ } Raw JSON</button>
+        </div>
+        <div id="pg-empty" class="empty">
+          <div class="empty-icon">🔮</div>
+          <div>Run a prediction to see results here</div>
+        </div>
+        <div id="pg-bars" class="hidden"></div>
+        <div id="pg-json" class="hidden mt-3">
+          <div class="text-xs text-muted mb-2">Request</div>
+          <div class="code-block" id="pg-json-req" style="max-height:160px"></div>
+          <div class="text-xs text-muted mb-2 mt-3">Response (raw)</div>
+          <div class="code-block" id="pg-json-res" style="max-height:200px"></div>
+        </div>
+      </div>
+
+      <div class="card mt-3">
+        <div class="card-title mb-3">Latency</div>
+        <div class="chart-wrap" style="height:160px"><canvas id="pg-lat-chart"></canvas></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── CLI ── -->
+<section class="page" id="page-cli">
+  <div class="page-h"><div><h1 class="page-title">CLI reference</h1><p class="page-sub">All <code>neural</code> commands.</p></div></div>
+
+  <div class="grid grid-2">
+    <div class="card">
+      <div class="card-title mb-3">Quick start</div>
+      <div class="code-block"><span class="code-comment"># Scaffold a config</span>
+neural init --model mlp --name my_exp
+
+<span class="code-comment"># Train</span>
+neural train --config runs/my_exp/config.yaml
+
+<span class="code-comment"># Evaluate</span>
+neural evaluate --config runs/my_exp/config.yaml
+
+<span class="code-comment"># Serve as REST API</span>
+neural serve --config runs/my_exp/config.yaml
+
+<span class="code-comment"># This dashboard</span>
+neural dashboard</div>
+    </div>
+
+    <div class="card">
+      <div class="card-title mb-3">neural train</div>
+      <div class="code-block"><span class="code-comment"># Override hyperparams</span>
+neural train -c config.yaml \
+  -O training.num_epochs=100 \
+  -O training.batch_size=128 \
+  -O training.optimizer.lr=5e-4
+
+<span class="code-comment"># Custom DB path</span>
+neural train -c config.yaml --db /tmp/forge.db</div>
+    </div>
+
+    <div class="card">
+      <div class="card-title mb-3">neural serve</div>
+      <div class="code-block">neural serve -c config.yaml \
+  -k runs/my_exp/checkpoints/checkpoint_best.pt \
+  --host 0.0.0.0 --port 8080
+
+<span class="code-comment"># Endpoints</span>
+GET  /health
+GET  /info
+POST /predict
+GET  /docs    <span class="code-comment">— Swagger UI</span></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title mb-3">neural export</div>
+      <div class="code-block"><span class="code-comment"># Export to ONNX</span>
+neural export -c config.yaml --format onnx
+
+<span class="code-comment"># Export to TorchScript</span>
+neural export -c config.yaml --format torchscript</div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Settings ── -->
+<section class="page" id="page-settings">
+  <div class="page-h"><div><h1 class="page-title">Settings</h1><p class="page-sub">Workspace info and dashboard health.</p></div></div>
+
+  <div class="grid grid-2-1">
+    <div>
+      <div class="card mb-3">
+        <div class="card-title mb-3">Workspace</div>
+        <div class="grid grid-2">
+          <div><div class="text-xs text-muted">Output directory</div><div class="text-mono mt-2" id="set-output">—</div></div>
+          <div><div class="text-xs text-muted">DB exists</div><div class="text-mono mt-2" id="set-db">—</div></div>
+          <div><div class="text-xs text-muted">Dashboard version</div><div class="text-mono mt-2" id="set-ver">—</div></div>
+          <div><div class="text-xs text-muted">Uptime</div><div class="text-mono mt-2" id="set-uptime">—</div></div>
+        </div>
+      </div>
+
+      <div class="card mb-3">
+        <div class="card-title mb-3">Maintenance</div>
+        <div class="row">
+          <button class="btn btn-secondary" onclick="cleanupStale()">Reset stale runs</button>
+          <button class="btn btn-secondary" onclick="refreshAll()">Refresh all data</button>
+        </div>
+        <div class="text-xs text-muted mt-3">"Reset stale runs" marks any experiment still <code>running</code> in the database as <code>interrupted</code>. Useful after a crash.</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title mb-3">System</div>
+      <div id="set-system"></div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<div class="scrim" id="scrim" onclick="closeDrawer()"></div>
+<aside class="drawer" id="drawer">
+  <div class="drawer-head">
+    <div>
+      <div class="drawer-title" id="dr-title">Experiment</div>
+      <div class="drawer-sub" id="dr-sub">—</div>
+    </div>
+    <div class="row-tight">
+      <button class="btn btn-danger btn-sm hidden" id="dr-interrupt" onclick="drInterrupt()">Stop</button>
+      <button class="btn btn-danger btn-sm hidden" id="dr-delete" onclick="drDelete()">Delete</button>
+      <button class="btn btn-icon btn-ghost" onclick="closeDrawer()">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+  </div>
+  <div class="drawer-body" id="dr-body"></div>
+</aside>
+
+<div class="scrim" id="palette-scrim" onclick="closePalette()"></div>
+<div class="palette" id="palette">
+  <input class="palette-search" id="palette-search" placeholder="Type a command or search…" oninput="renderPalette()" onkeydown="palettenKey(event)" />
+  <div class="palette-list" id="palette-list"></div>
+</div>
+
+<!-- HuggingFace Dataset Browser drawer -->
+<div class="scrim" id="hf-scrim" onclick="closeHFBrowser()"></div>
+<aside class="drawer" id="hf-drawer" style="width:min(820px, 96vw)">
+  <div class="drawer-head">
+    <div>
+      <div class="drawer-title">HuggingFace dataset browser</div>
+      <div class="drawer-sub">Search the Hub by modality and pin one into your config</div>
+    </div>
+    <button class="btn btn-icon btn-ghost" onclick="closeHFBrowser()">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+  </div>
+  <div class="drawer-body" id="hf-body" style="padding:14px 18px">
+    <div class="row" style="margin-bottom:12px;gap:8px">
+      <input class="input" id="hf-q" placeholder="Search datasets — e.g. 'reviews', 'speech', 'flowers'" oninput="hfDebouncedSearch()" />
+      <select class="select" id="hf-modality" style="max-width:160px" onchange="hfRunSearch()">
+        <option value="">Any modality</option>
+        <option value="image">Image</option>
+        <option value="text">Text</option>
+        <option value="audio">Audio</option>
+        <option value="video">Video</option>
+        <option value="time_series">Time-series</option>
+        <option value="tabular">Tabular</option>
+      </select>
+      <button class="btn btn-secondary btn-sm" onclick="hfRunSearch()">Search</button>
+    </div>
+    <div class="text-xs text-muted mb-3" id="hf-status">Showing curated picks. Type to search the full Hub.</div>
+    <div id="hf-results"></div>
+  </div>
+</aside>
+
+<div class="toasts" id="toasts"></div>
+
+<script src="/static/app.js" defer></script>
+</body>
+</html>
