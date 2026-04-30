@@ -5,6 +5,7 @@ const State = {
   experiments: [], checkpoints: [], curvesData: [], charts: {},
   page: 'overview', expSort: { col: 'id', dir: 'desc' },
   trainPoll: null, liveES: null, liveState: null,
+  trainLogES: null, trainLogModel: null,
   proxyLatencyHistory: [], drawerExpId: null,
 };
 
@@ -78,6 +79,9 @@ function navigate(name) {
   if (!Pages.includes(name)) return;
   if (State.page === 'train' && name !== 'train' && State.trainPoll) {
     clearInterval(State.trainPoll); State.trainPoll = null;
+  }
+  if (State.page === 'train' && name !== 'train' && State.trainLogES) {
+    State.trainLogES.close(); State.trainLogES = null;
   }
   if (State.page === 'live' && name !== 'live' && State.liveES) {
     State.liveES.close(); State.liveES = null;
@@ -332,9 +336,157 @@ function renderOverviewChart(exps) {
 /* TRAIN */
 async function initTrain() {
   await loadConfigs();
+  initTrainLogModel();
+  await refreshTrainLogs();
+  connectTrainLogStream();
   await pollTrainStatus();
   if (State.trainPoll) clearInterval(State.trainPoll);
   State.trainPoll = setInterval(pollTrainStatus, 3000);
+}
+function initTrainLogModel() {
+  State.trainLogModel = {
+    rows: [''],
+    maxRows: 1200,
+    cursorRow: 0,
+    ansiMode: 'none', // none | esc | csi | osc
+    ansiBuf: '',
+    sawCR: false,
+  };
+}
+function processTrainLogChunk(chunk) {
+  if (!State.trainLogModel) initTrainLogModel();
+  const m = State.trainLogModel;
+  const clampCursor = () => {
+    if (m.cursorRow < 0) m.cursorRow = 0;
+    if (m.cursorRow >= m.rows.length) m.cursorRow = m.rows.length - 1;
+  };
+  const trimRows = () => {
+    if (m.rows.length > m.maxRows) {
+      const drop = m.rows.length - m.maxRows;
+      m.rows.splice(0, drop);
+      m.cursorRow = Math.max(0, m.cursorRow - drop);
+    }
+  };
+  const advanceLine = () => {
+    // Terminal newline moves the cursor down; it only creates a new row when
+    // we're already at the bottom.
+    if (m.cursorRow >= m.rows.length - 1) {
+      m.rows.push('');
+    } else {
+      m.cursorRow += 1;
+    }
+    trimRows();
+  };
+  const handleCsi = (seq) => {
+    const final = seq.slice(-1);
+    const body = seq.slice(0, -1);
+    const nums = body.replace(/^[?]/, '').split(';').filter(Boolean).map((n) => parseInt(n, 10));
+    const n = Number.isFinite(nums[0]) ? nums[0] : 1;
+    if (final === 'A') {
+      m.cursorRow -= n;
+      clampCursor();
+    } else if (final === 'B') {
+      m.cursorRow += n;
+      clampCursor();
+    } else if (final === 'K') {
+      m.rows[m.cursorRow] = '';
+    } else if (final === 'J') {
+      // clear display; for logs, keep only current row to prevent noise
+      m.rows = [m.rows[m.cursorRow] || ''];
+      m.cursorRow = 0;
+    }
+  };
+  for (const ch of chunk) {
+    if (m.ansiMode === 'esc') {
+      if (ch === '[') {
+        m.ansiMode = 'csi';
+        m.ansiBuf = '';
+        continue;
+      }
+      if (ch === ']') {
+        m.ansiMode = 'osc';
+        m.ansiBuf = '';
+        continue;
+      }
+      m.ansiMode = 'none';
+      continue;
+    }
+    if (m.ansiMode === 'csi') {
+      m.ansiBuf += ch;
+      const code = ch.charCodeAt(0);
+      if (code >= 0x40 && code <= 0x7e) {
+        handleCsi(m.ansiBuf);
+        m.ansiMode = 'none';
+        m.ansiBuf = '';
+      }
+      continue;
+    }
+    if (m.ansiMode === 'osc') {
+      // OSC ends with BEL or ST (ESC \). Treat BEL as terminator; ESC transitions.
+      if (ch === '\x07') {
+        m.ansiMode = 'none';
+      } else if (ch === '\x1b') {
+        m.ansiMode = 'esc';
+      }
+      continue;
+    }
+
+    if (m.sawCR) {
+      if (ch === '\n') {
+        advanceLine();
+        m.sawCR = false;
+        continue;
+      }
+      // Standalone CR means "return to line start / overwrite".
+      m.rows[m.cursorRow] = '';
+      m.sawCR = false;
+    }
+    if (ch === '\x1b') {
+      m.ansiMode = 'esc';
+      continue;
+    }
+    if (ch === '\r') {
+      m.sawCR = true;
+      continue;
+    }
+    if (ch === '\n') {
+      advanceLine();
+      continue;
+    }
+    m.rows[m.cursorRow] += ch;
+  }
+}
+function renderTrainLogs() {
+  const el = document.getElementById('train-log');
+  if (!el || !State.trainLogModel) return;
+  const text = State.trainLogModel.rows.join('\n');
+  el.textContent = text || 'Subprocess output will appear here after training starts…';
+  el.scrollTop = el.scrollHeight;
+}
+function renderTrainLogsRawFallback(rawText) {
+  const el = document.getElementById('train-log');
+  if (!el) return;
+  if (!rawText) return;
+  // If reducer output is unexpectedly empty, still show readable snapshot text.
+  el.textContent = rawText.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '');
+  el.scrollTop = el.scrollHeight;
+}
+function connectTrainLogStream() {
+  if (State.trainLogES) {
+    State.trainLogES.close();
+    State.trainLogES = null;
+  }
+  const es = new EventSource('/api/train/logs/stream');
+  State.trainLogES = es;
+  es.addEventListener('chunk', (e) => {
+    try {
+      const payload = JSON.parse(e.data || '{}');
+      if (payload.chunk) {
+        processTrainLogChunk(payload.chunk);
+        renderTrainLogs();
+      }
+    } catch {}
+  });
 }
 async function loadConfigs() {
   try {
@@ -460,7 +612,6 @@ async function pollTrainStatus() {
       text.textContent = `Training — PID ${s.pid}`;
       stopBtn.disabled = false;
       startBtn.disabled = true;
-      refreshTrainLogs();
     } else {
       dot.className = 'dot';
       const hasCfg = document.getElementById('cfg-path').value.trim() || document.getElementById('cfg-select').value;
@@ -473,11 +624,12 @@ async function pollTrainStatus() {
 }
 async function refreshTrainLogs() {
   try {
-    const data = await api('/api/train/logs?lines=200');
-    const el = document.getElementById('train-log');
-    if (data.lines && data.lines.length) {
-      el.textContent = data.lines.join('\n');
-      el.scrollTop = el.scrollHeight;
+    const data = await api('/api/train/logs?chars=200000');
+    initTrainLogModel();
+    if (data.text) processTrainLogChunk(data.text);
+    renderTrainLogs();
+    if (data.text && (!State.trainLogModel || State.trainLogModel.rows.join('').trim() === '')) {
+      renderTrainLogsRawFallback(data.text);
     }
   } catch {}
 }

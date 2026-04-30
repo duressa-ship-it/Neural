@@ -36,6 +36,7 @@ SPA           /                              serves static/index.html
 from __future__ import annotations
 
 import asyncio
+import codecs
 import json
 import os
 import platform
@@ -214,9 +215,9 @@ def _spawn_with_pty_log(cmd, env, log_path: Path):
     real TTY and emit live updates instead of suppressing themselves.
 
     Output is bridged into `log_path` by a background thread that reads from
-    the master PTY and writes to disk. Carriage-return progress updates land
-    in the file as separate "lines" so the dashboard's log endpoint can show
-    the latest progress instead of a single ever-growing line.
+    the master PTY and writes to disk without rewriting control characters.
+    This preserves raw terminal semantics (`\r`, ANSI controls, etc.) so the
+    renderer can correctly model in-place updates.
 
     Returns `(Popen, log_fh, bridge_thread, stop_event)`. The caller is
     responsible for `stop_event.set()` + `thread.join()` on shutdown.
@@ -241,10 +242,7 @@ def _spawn_with_pty_log(cmd, env, log_path: Path):
     stop_event = _threading.Event()
 
     def _bridge():
-        # Buffer up to a chunk and flush to log_fh, normalising '\r' so each
-        # progress update becomes its own line and the dashboard's tail sees
-        # newest-first instead of one huge wrapped line.
-        buf = b""
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         try:
             while not stop_event.is_set():
                 try:
@@ -253,29 +251,19 @@ def _spawn_with_pty_log(cmd, env, log_path: Path):
                     break
                 if not chunk:
                     break
-                buf += chunk
-                # Normalise: convert solo '\r' into '\n' (so tqdm progress
-                # updates flush to disk as discrete lines).
-                normalised = buf.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-                # Keep only complete lines for atomic writes
-                if b"\n" in normalised:
-                    last_nl = normalised.rfind(b"\n")
-                    head, buf = normalised[:last_nl + 1], normalised[last_nl + 1:]
-                    try:
-                        log_fh.write(head.decode("utf-8", errors="replace"))
-                        log_fh.flush()
-                    except Exception:
-                        break
-                else:
-                    buf = normalised
-        finally:
-            # Flush whatever's left (e.g. final no-newline line) on close
-            if buf:
                 try:
-                    log_fh.write(buf.decode("utf-8", errors="replace"))
+                    log_fh.write(decoder.decode(chunk, final=False))
                     log_fh.flush()
                 except Exception:
-                    pass
+                    break
+        finally:
+            try:
+                tail = decoder.decode(b"", final=True)
+                if tail:
+                    log_fh.write(tail)
+                    log_fh.flush()
+            except Exception:
+                pass
             try: os.close(master_fd)
             except Exception: pass
 
@@ -284,41 +272,22 @@ def _spawn_with_pty_log(cmd, env, log_path: Path):
     return proc, log_fh, thread, stop_event
 
 
-_ANSI_RE = None  # lazily compiled below
-
-def _strip_ansi(text: str) -> str:
-    """Remove ANSI color/cursor escape sequences. The PTY makes Rich/click
-    emit color codes the browser can't render — they look like ``[1m...[0m``
-    in the UI. This produces clean human-readable text instead."""
-    global _ANSI_RE
-    if _ANSI_RE is None:
-        import re as _re
-        # Matches CSI-style escapes (color + cursor) plus bare control chars.
-        _ANSI_RE = _re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
-    return _ANSI_RE.sub("", text)
-
-
-def _collapse_progress(lines: List[str]) -> List[str]:
-    """
-    Collapse consecutive tqdm-style progress lines that share a common
-    prefix (everything before the percentage), keeping only the latest.
-
-    A real terminal collapses these via `\\r`, but we already split each
-    overwrite into its own line on disk. This restores the same visual.
-    """
-    import re as _re
-    pct_re = _re.compile(r"\s+\d{1,3}%")    # the "  19%" or " 100%" marker
-    out: List[str] = []
-    for ln in lines:
-        m = pct_re.search(ln)
-        if not m:
-            out.append(ln); continue
-        prefix = ln[:m.start()]
-        if out and out[-1].startswith(prefix) and pct_re.search(out[-1]):
-            out[-1] = ln              # replace previous progress for same task
-        else:
-            out.append(ln)
-    return out
+def _tail_text(path: Path, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            read_size = min(size, max_chars * 4)
+            f.seek(max(0, size - read_size), os.SEEK_SET)
+            data = f.read()
+        text = data.decode("utf-8", errors="replace")
+        if len(text) > max_chars:
+            text = text[-max_chars:]
+        return text
+    except Exception:
+        return ""
 
 
 def _shutdown_pty_bridge(state: dict) -> None:
@@ -1500,24 +1469,53 @@ def create_dashboard_app(output_dir: str = "runs") -> FastAPI:
 
     @app.get("/api/train/logs", tags=["Training"],
              summary="Tail of subprocess stdout/stderr")
-    async def train_logs(lines: int = 200, raw: bool = False):
-        """Tail of the subprocess stdout/stderr.
-
-        By default the response strips ANSI color sequences and collapses
-        consecutive tqdm-style progress lines (sharing an identifying
-        prefix) so a 5-minute download isn't 4000 wrapped lines in the UI.
-        Pass `?raw=true` to opt out and see exactly what was written.
-        """
+    async def train_logs(chars: int = 200000):
+        """Tail of subprocess stdout/stderr as raw terminal text."""
         log_path: Path = state["train_log_path"]
         if not log_path.exists():
-            return {"lines": []}
-        with open(log_path) as f:
-            all_lines = f.readlines()
-        out_lines = [ln.rstrip("\n") for ln in all_lines[-lines:]]
-        if not raw:
-            out_lines = [_strip_ansi(ln) for ln in out_lines]
-            out_lines = _collapse_progress(out_lines)
-        return {"lines": out_lines}
+            return {"text": ""}
+        return {"text": _tail_text(log_path, max_chars=min(max(int(chars), 1), 1_000_000))}
+
+    @app.get("/api/train/logs/stream", tags=["Training"], summary="SSE stream of raw terminal log chunks")
+    async def train_logs_stream(request: Request):
+        async def generator():
+            log_path: Path = state["train_log_path"]
+            pos = 0
+            last_heartbeat = time.time()
+            yield "event: connected\ndata: {}\n\n"
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    if log_path.exists():
+                        size = log_path.stat().st_size
+                        if size < pos:
+                            pos = 0
+                        if size > pos:
+                            with open(log_path, "rb") as f:
+                                f.seek(pos, os.SEEK_SET)
+                                raw = f.read(size - pos)
+                            pos = size
+                            chunk = raw.decode("utf-8", errors="replace")
+                            if chunk:
+                                payload = json.dumps({"chunk": chunk})
+                                yield f"event: chunk\ndata: {payload}\n\n"
+                except Exception:
+                    pass
+                if time.time() - last_heartbeat > 15:
+                    last_heartbeat = time.time()
+                    yield ": heartbeat\n\n"
+                await asyncio.sleep(0.2)
+
+        return StreamingResponse(
+            generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
+        )
 
     # ------------------------------------------------------------------
     # Inference proxy
