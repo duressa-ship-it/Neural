@@ -1,0 +1,72 @@
+# NeuralForge — Bidirectional LSTM Example Config
+# Sequence classification (e.g. time series, sensor data, text as embeddings)
+# Usage: neural train --config configs/examples/lstm_sequence.yaml
+
+name: lstm_sequence
+description: "Bidirectional LSTM for sequence classification"
+tags: [rnn, lstm, sequence, classification]
+output_dir: runs
+
+model:
+  type: rnn
+  name: bilstm_classifier
+  framework: pytorch
+  rnn:
+    variant: lstm            # lstm | gru | rnn
+    input_size: 64           # features per timestep (e.g. embedding dim)
+    hidden_size: 256         # LSTM hidden state size
+    num_layers: 3            # stacked LSTM layers
+    bidirectional: true      # → effective dim = 256*2 = 512
+    dropout: 0.2             # between LSTM layers
+    output_size: 5           # 5 sequence classes
+    output_mode: last        # last | mean | all
+    fc_layers:
+      - size: 256
+        activation: gelu
+        dropout: 0.3
+        batch_norm: false
+      - size: 128
+        activation: relu
+        dropout: 0.2
+        batch_norm: false
+
+training:
+  task: classification
+  loss: cross_entropy
+  num_epochs: 80
+  batch_size: 64
+  optimizer:
+    type: adamw
+    lr: 0.001
+    weight_decay: 0.0001
+    grad_clip: 5.0           # important for RNNs to prevent exploding gradients
+  scheduler:
+    type: plateau
+    patience: 5
+    gamma: 0.5
+    min_lr: 1.0e-6
+  early_stopping_patience: 12
+  mixed_precision: false
+  accumulation_steps: 2
+  num_workers: 4
+  seed: 42
+  device: auto
+  checkpoint_every: 5
+
+data:
+  source: synthetic
+  synthetic_n_samples: 5000
+  synthetic_n_features: 64   # one timestep's features (seq model unrolls this)
+  synthetic_n_classes: 5
+  val_split: 0.2
+  test_split: 0.1
+
+  # For real CSV data:
+  # source: csv
+  # path: data/sequences.csv
+  # target_column: label
+
+deploy:
+  host: "0.0.0.0"
+  port: 8082
+  max_batch_size: 32

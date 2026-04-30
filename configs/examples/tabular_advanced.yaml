@@ -1,0 +1,54 @@
+# Advanced tabular learner — mix of numeric + categorical features.
+# Each categorical column gets its own learned embedding before being
+# concatenated with the (batch-normed) numeric features and fed to a
+# dense stack. This is the right default for production tabular tasks
+# (fraud, churn, recommender features).
+#
+# Provide a CSV at data.path with the columns referenced below.
+
+name: tabular_advanced
+description: TabularNet with categorical embeddings on a CSV
+tags: [tabular, categorical, churn]
+output_dir: runs
+
+model:
+  type: tabular
+  name: tabular_baseline
+  framework: pytorch
+  tabular:
+    numeric_features: [age, income, balance, days_since_signup]
+    categorical_features:
+      - {name: country, cardinality: 200}              # embed_dim auto-sized
+      - {name: plan,    cardinality: 5,   embed_dim: 4}
+      - {name: device,  cardinality: 25,  embed_dim: 8}
+    output_size: 2                                     # binary
+    hidden_layers:
+      - {size: 256, activation: relu, dropout: 0.2, batch_norm: true}
+      - {size: 128, activation: relu, dropout: 0.2, batch_norm: true}
+    output_activation: none
+    impute_strategy: mean
+
+training:
+  task: classification
+  loss: cross_entropy
+  num_epochs: 30
+  batch_size: 256
+  optimizer:
+    type: adamw
+    lr: 1.0e-3
+    weight_decay: 1.0e-4
+  scheduler:
+    type: cosine
+  early_stopping_patience: 5
+  device: auto
+
+data:
+  source: csv
+  path: data/customers.csv      # ← change to your CSV path
+  target_column: churned
+  val_split: 0.2
+  test_split: 0.1
+
+deploy:
+  host: 0.0.0.0
+  port: 8080

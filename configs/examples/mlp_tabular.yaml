@@ -1,0 +1,75 @@
+# NeuralForge — MLP Example Config
+# Binary classification on tabular/CSV data
+# Usage: neural train --config configs/examples/mlp_tabular.yaml
+
+name: mlp_tabular_example
+description: "MLP binary classification on tabular data"
+tags: [mlp, tabular, classification]
+output_dir: runs
+
+model:
+  type: mlp
+  name: mlp_tabular
+  framework: pytorch
+  mlp:
+    input_size: 20
+    hidden_layers:
+      - size: 512
+        activation: relu
+        dropout: 0.3
+        batch_norm: true
+      - size: 256
+        activation: relu
+        dropout: 0.2
+        batch_norm: true
+      - size: 128
+        activation: gelu
+        dropout: 0.1
+        batch_norm: false
+    output_size: 2
+    output_activation: none
+
+training:
+  task: classification
+  loss: cross_entropy
+  num_epochs: 100
+  batch_size: 128
+  optimizer:
+    type: adamw
+    lr: 0.001
+    weight_decay: 0.0001
+    grad_clip: 1.0
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+  scheduler:
+    type: warmup_cosine
+    warmup_steps: 200
+    min_lr: 1.0e-6
+  early_stopping_patience: 15
+  mixed_precision: false
+  accumulation_steps: 1
+  num_workers: 4
+  seed: 42
+  device: auto
+  checkpoint_every: 10
+  keep_best_only: true
+
+data:
+  source: synthetic                # switch to 'csv' for real data
+  synthetic_n_samples: 10000
+  synthetic_n_features: 20
+  synthetic_n_classes: 2
+  synthetic_noise: 0.1
+  val_split: 0.2
+  test_split: 0.1
+
+  # For CSV source, uncomment:
+  # source: csv
+  # path: data/my_dataset.csv
+  # target_column: label
+  # feature_columns: null         # null = all except target
+
+deploy:
+  host: "0.0.0.0"
+  port: 8080
+  max_batch_size: 64

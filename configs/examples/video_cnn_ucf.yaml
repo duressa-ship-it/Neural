@@ -1,0 +1,50 @@
+# Video classification — 3D CNN over short clips (experimental)
+# This is a *minimal* baseline. For state-of-the-art video, use the
+# `pretrained` field once we add HF video model wrappers.
+#
+# Replace dataset_name with any HF dataset that has a Video feature
+# (or a Sequence(Image) frame stack).
+
+name: video_cnn_ucf
+description: Video classification with a basic 3D CNN
+tags: [video, experimental]
+output_dir: runs
+
+model:
+  type: video_cnn
+  name: c3d_baseline
+  framework: pytorch
+  video_cnn:
+    input_channels: 3
+    num_frames: 16
+    input_height: 112
+    input_width: 112
+    conv_layers:
+      - {out_channels: 32,  kernel_size: 3, stride: 1, pool: true}
+      - {out_channels: 64,  kernel_size: 3, stride: 1, pool: true}
+      - {out_channels: 128, kernel_size: 3, stride: 1, pool: true}
+    fc_layers:
+      - {size: 256, activation: relu, dropout: 0.5}
+    output_size: 10
+
+training:
+  task: classification
+  loss: cross_entropy
+  num_epochs: 20
+  batch_size: 8                 # videos are heavy
+  optimizer:
+    type: adamw
+    lr: 5.0e-4
+  scheduler:
+    type: cosine
+  early_stopping_patience: 5
+  device: auto
+
+data:
+  source: huggingface
+  dataset_name: ucf101          # ← any dataset with a Video feature
+  max_samples: 1000
+
+deploy:
+  host: 0.0.0.0
+  port: 8080

@@ -1,0 +1,110 @@
+# NeuralForge — CNN Example Config
+# Image classification on CIFAR-10
+# Usage: neural train --config configs/examples/cnn_cifar10.yaml
+
+name: cnn_cifar10
+description: "CNN image classification on CIFAR-10 (10 classes)"
+tags: [cnn, image, cifar10]
+output_dir: runs
+
+model:
+  type: cnn
+  name: cnn_cifar10
+  framework: pytorch
+  cnn:
+    input_channels: 3
+    input_height: 32
+    input_width: 32
+
+    # Custom conv stack (set backbone: null to use this)
+    conv_layers:
+      - out_channels: 64
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        batch_norm: true
+        pool: false
+        activation: relu
+      - out_channels: 64
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        batch_norm: true
+        pool: true
+        pool_size: 2
+      - out_channels: 128
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        batch_norm: true
+        pool: false
+        activation: relu
+      - out_channels: 128
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        batch_norm: true
+        pool: true
+        pool_size: 2
+      - out_channels: 256
+        kernel_size: 3
+        stride: 1
+        padding: 1
+        batch_norm: true
+        pool: true
+        pool_size: 2
+
+    fc_layers:
+      - size: 512
+        activation: relu
+        dropout: 0.5
+        batch_norm: false
+      - size: 256
+        activation: relu
+        dropout: 0.3
+        batch_norm: false
+
+    output_size: 10
+    backbone: null           # set to resnet18/resnet50/efficientnet_b0 for transfer learning
+    pretrained: true
+    freeze_backbone: false
+
+training:
+  task: image_classification
+  loss: cross_entropy
+  num_epochs: 100
+  batch_size: 128
+  optimizer:
+    type: sgd
+    lr: 0.1
+    momentum: 0.9
+    weight_decay: 0.0005
+    grad_clip: null
+  scheduler:
+    type: cosine
+    t_max: 100
+    min_lr: 1.0e-5
+  early_stopping_patience: 20
+  mixed_precision: true
+  accumulation_steps: 1
+  num_workers: 4
+  seed: 42
+  device: auto
+  checkpoint_every: 10
+
+data:
+  source: huggingface
+  dataset_name: cifar10
+  val_split: 0.1
+  transforms:
+    image:
+      resize: [32, 32]
+      normalize:
+        mean: [0.4914, 0.4822, 0.4465]
+        std: [0.2470, 0.2435, 0.2616]
+      augment: true
+
+deploy:
+  host: "0.0.0.0"
+  port: 8081
+  max_batch_size: 32

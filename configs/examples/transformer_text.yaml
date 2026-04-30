@@ -1,0 +1,85 @@
+# NeuralForge — Transformer Text Classification Config
+# Two variants: from-scratch and fine-tuning a pretrained HuggingFace model
+# Usage: neural train --config configs/examples/transformer_text.yaml
+
+name: transformer_text
+description: "Transformer encoder for text classification (sentiment)"
+tags: [transformer, nlp, classification, text]
+output_dir: runs
+
+model:
+  type: transformer
+  name: transformer_classifier
+  framework: pytorch
+  transformer:
+    # ---------- Option A: from-scratch transformer ----------
+    vocab_size: 30522        # BERT vocabulary size
+    max_seq_len: 128
+    d_model: 256
+    num_heads: 8             # must divide d_model
+    num_encoder_layers: 4
+    num_decoder_layers: 0    # 0 = encoder-only (classification)
+    d_ff: 512
+    dropout: 0.1
+    output_size: 2           # binary: positive / negative
+    output_mode: cls         # cls | mean | all
+    positional_encoding: sinusoidal
+
+    # ---------- Option B: fine-tune pretrained (uncomment to use) ----------
+    # use_pretrained: bert-base-uncased
+    # use_pretrained: distilbert-base-uncased
+    # use_pretrained: roberta-base
+
+training:
+  task: text_classification
+  loss: cross_entropy
+  num_epochs: 30
+  batch_size: 32
+  val_batch_size: 64
+  optimizer:
+    type: adamw
+    lr: 2.0e-5               # small LR for fine-tuning (or 1e-4 for from-scratch)
+    weight_decay: 0.01
+    grad_clip: 1.0
+    betas: [0.9, 0.999]
+  scheduler:
+    type: warmup_cosine
+    warmup_steps: 500
+    min_lr: 1.0e-7
+  early_stopping_patience: 5
+  mixed_precision: true
+  accumulation_steps: 2
+  num_workers: 4
+  seed: 42
+  device: auto
+  checkpoint_every: 5
+  keep_best_only: true
+
+data:
+  # HuggingFace IMDb sentiment dataset
+  source: huggingface
+  dataset_name: imdb
+  dataset_split: train
+  text_column: text
+  label_column: label
+  val_split: 0.1
+  max_samples: 5000          # remove for full 25k training set
+
+  transforms:
+    text:
+      tokenizer: bert-base-uncased
+      max_length: 128
+      padding: true
+      truncation: true
+
+  # Synthetic fallback (no internet required)
+  # source: synthetic
+  # synthetic_n_samples: 2000
+  # synthetic_n_features: 128
+  # synthetic_n_classes: 2
+
+deploy:
+  host: "0.0.0.0"
+  port: 8083
+  max_batch_size: 16
+  timeout_seconds: 30.0

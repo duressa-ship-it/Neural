@@ -1,0 +1,52 @@
+# TCN time-series classification example
+# Each input is a 1D numeric sequence (1 channel, T timesteps).
+# TCN uses dilated causal convolutions to model long-range dependencies
+# without recurrent state.
+#
+# Try with a synthetic warm-up first:
+#   neural train -c configs/examples/tcn_timeseries.yaml
+#
+# To use with HF data, switch data.source to 'huggingface' and pick a
+# dataset with a numeric Sequence column (e.g. 'monash/m3' or 'electricity').
+
+name: tcn_timeseries
+description: Temporal Convolutional Network — synthetic 4-class time-series
+tags: [time-series, tcn]
+output_dir: runs
+
+model:
+  type: tcn
+  name: tcn_4class
+  framework: pytorch
+  tcn:
+    input_size: 1
+    output_size: 4
+    channels: [64, 64, 64, 64]
+    kernel_size: 3
+    dropout: 0.1
+    output_mode: last           # last | mean | max | all
+    pooling: last
+
+training:
+  task: classification
+  loss: cross_entropy
+  num_epochs: 50
+  batch_size: 64
+  optimizer:
+    type: adamw
+    lr: 1.0e-3
+  scheduler:
+    type: cosine
+  early_stopping_patience: 10
+  device: auto
+
+data:
+  source: synthetic
+  synthetic_n_samples: 4000
+  synthetic_n_features: 64      # treated as timesteps per sample
+  synthetic_n_classes: 4
+  val_split: 0.2
+
+deploy:
+  host: 0.0.0.0
+  port: 8080

@@ -1,0 +1,51 @@
+# Audio classification — keyword spotting on Speech Commands
+# Architecture: mel-spectrogram → 2D CNN → FC head
+#
+# Dataset: 35 short spoken words / commands.
+# Run: neural train -c configs/examples/audio_cnn_speech.yaml
+
+name: audio_cnn_speech
+description: Spoken-keyword classifier on the Speech Commands dataset
+tags: [audio, speech, keyword-spotting]
+output_dir: runs
+
+model:
+  type: audio_cnn
+  name: kw_spotter
+  framework: pytorch
+  audio_cnn:
+    sample_rate: 16000
+    duration_secs: 1.0          # most keyword clips are < 1s
+    use_spectrogram: true       # mel-spec → 2D conv path
+    n_mels: 64
+    n_fft: 1024
+    hop_length: 256
+    conv_channels: [32, 64, 128, 256]
+    fc_layers:
+      - {size: 128, activation: relu, dropout: 0.3}
+    output_size: 35             # number of keyword classes
+    pretrained: null            # set to "facebook/wav2vec2-base" to fine-tune
+
+training:
+  task: classification
+  loss: cross_entropy
+  num_epochs: 20
+  batch_size: 32
+  optimizer:
+    type: adamw
+    lr: 1.0e-3
+    weight_decay: 1.0e-4
+  scheduler:
+    type: cosine
+  early_stopping_patience: 5
+  device: auto
+
+data:
+  source: huggingface
+  dataset_name: speech_commands
+  dataset_split: train
+  max_samples: 8000             # subsample for fast iteration
+
+deploy:
+  host: 0.0.0.0
+  port: 8080
