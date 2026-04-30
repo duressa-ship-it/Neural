@@ -1,0 +1,42 @@
+[project]
+name = "neural-platform"
+version = "0.1.0"
+description = "NeuralForge — a multi-framework platform for building, training, and deploying neural networks"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "pydantic>=2.0.0",
+    "pyyaml>=6.0",
+    "click>=8.1.0",
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.23.0",
+    "numpy>=1.24.0",
+    "scikit-learn>=1.3.0",
+    "tqdm>=4.65.0",
+    "rich>=13.0.0",
+    "pillow>=10.0.0",
+    "pandas>=2.0.0",
+    "python-multipart>=0.0.6",
+    "aiofiles>=23.0.0",
+]
+
+[project.optional-dependencies]
+tensorflow = ["tensorflow>=2.13.0"]
+jax = ["jax>=0.4.0", "flax>=0.7.0"]
+nlp = ["transformers>=4.30.0", "datasets>=2.14.0"]
+dev = ["pytest>=7.0.0", "black>=23.0.0"]
+
+[project.scripts]
+neural = "neural_platform.cli.commands:cli"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["neural_platform*"]
+
+[tool.setuptools.package-data]
+"neural_platform" = ["web/static/*.html"]
