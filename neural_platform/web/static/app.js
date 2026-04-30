@@ -459,16 +459,52 @@ function processTrainLogChunk(chunk) {
 function renderTrainLogs() {
   const el = document.getElementById('train-log');
   if (!el || !State.trainLogModel) return;
-  const text = State.trainLogModel.rows.join('\n');
+  const text = sanitizeTrainLogText(State.trainLogModel.rows.join('\n'));
   el.textContent = text || 'Subprocess output will appear here after training starts…';
   el.scrollTop = el.scrollHeight;
+}
+function sanitizeTrainLogText(text) {
+  if (!text) return text;
+  const lines = text.split('\n');
+  const out = [];
+  const interrupted = lines.some((ln) => ln.includes('Training interrupted by user.'));
+  for (let i = 0; i < lines.length; i += 1) {
+    const ln = lines[i];
+    if (!interrupted) {
+      out.push(ln);
+      continue;
+    }
+    // Collapse known multiprocessing/DataLoader teardown noise after Ctrl-C.
+    if (ln.startsWith('Exception ignored while calling deallocator <function _MultiProcessingDataLoaderIter.__del__')) {
+      while (i < lines.length && lines[i].trim() !== '') i += 1;
+      out.push('[suppressed DataLoader teardown traceback after interrupt]');
+      continue;
+    }
+    if (ln.startsWith('Traceback (most recent call last):') && i + 1 < lines.length && lines[i + 1].includes('multiprocessing.spawn')) {
+      let sawKeyboardInterrupt = false;
+      while (i < lines.length) {
+        if (lines[i].includes('KeyboardInterrupt')) {
+          sawKeyboardInterrupt = true;
+          break;
+        }
+        i += 1;
+      }
+      out.push(sawKeyboardInterrupt
+        ? '[suppressed multiprocessing KeyboardInterrupt traceback after interrupt]'
+        : '[suppressed multiprocessing traceback after interrupt]');
+      continue;
+    }
+    out.push(ln);
+  }
+  return out.join('\n');
 }
 function renderTrainLogsRawFallback(rawText) {
   const el = document.getElementById('train-log');
   if (!el) return;
   if (!rawText) return;
   // If reducer output is unexpectedly empty, still show readable snapshot text.
-  el.textContent = rawText.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '');
+  const stripped = rawText.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '');
+  el.textContent = sanitizeTrainLogText(stripped);
   el.scrollTop = el.scrollHeight;
 }
 function connectTrainLogStream() {
