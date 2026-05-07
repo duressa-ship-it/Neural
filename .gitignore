@@ -22,3 +22,20 @@ runs/
 *.log
 *.db
 *.pt
+*.jsonl
+
+# AI tool config
+.claude/
+.cursor/
+.cline
+
+# Env files
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode
+
+# OS 
+.DS_Store
