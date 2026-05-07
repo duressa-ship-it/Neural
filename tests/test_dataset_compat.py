@@ -33,8 +33,12 @@ from neural_platform.core.hf_introspect import inspect_dataset as inspect_hf_fea
 def _validate(cfg):
     """Validator wrapper used by tests. Skips the package-availability audit
     so the suite stays deterministic in minimal environments (CI, sandbox)
-    that may lack optional deps like `transformers` or `torchaudio`."""
-    return validate_config(cfg, check_deps=False)
+    that may lack optional deps like `transformers` or `torchaudio`. Also
+    skips the remote model-source inspection and resource-fit checks —
+    those touch the HuggingFace Hub or `psutil` and would make the tests
+    flaky/slow."""
+    return validate_config(cfg, check_deps=False,
+                           check_remote=False, check_resources=False)
 
 
 # ---------------------------------------------------------------------------

@@ -301,11 +301,56 @@ def validate(config: str, strict: bool, as_json: bool):
 @click.option("--config", "-c", required=True, type=click.Path(exists=True), help="Path to config YAML/JSON")
 @click.option("--override", "-O", multiple=True, help="Override config values: key=value (e.g. training.lr=0.001)")
 @click.option("--db", default=None, help="Path to experiments database (default: <output_dir>/neuralforge.db)")
-def train(config: str, override: tuple, db: Optional[str]):
-    """Train a model from a config file."""
+@click.option("--resume", "resume_path", type=click.Path(exists=True), default=None,
+              help="Continue training from a checkpoint .pt — restores model weights, optimizer "
+                   "state, scheduler state, and the epoch counter. Use this to extend a run.")
+@click.option("--finetune", "finetune_path", type=click.Path(exists=True), default=None,
+              help="Fine-tune from a checkpoint .pt — restores ONLY the model weights. Optimizer "
+                   "and scheduler start fresh; the epoch counter resets. Mutually exclusive with --resume.")
+@click.option("--resume-from-best", "resume_from_best", default=None,
+              help="Shorthand: pass a run name (or path to its run_dir) and the trainer picks "
+                   "<run>/checkpoints/checkpoint_best.pt. Combine with --resume or --finetune to "
+                   "pick the mode (default: --resume).")
+def train(config: str, override: tuple, db: Optional[str],
+          resume_path: Optional[str], finetune_path: Optional[str],
+          resume_from_best: Optional[str]):
+    """Train a model from a config file.
+
+    \b
+    Resume vs. fine-tune:
+      neural train -c cfg.yaml --resume runs/exp/checkpoints/checkpoint_best.pt
+        Continues exactly where the run left off (optimizer/scheduler/epoch).
+
+      neural train -c cfg.yaml --finetune runs/imdb/checkpoints/checkpoint_best.pt
+        Loads only the weights; optimizer + scheduler start fresh.
+        Use this when adapting a model to a new dataset or lowering the LR.
+    """
     from neural_platform.core.config import load_config
     from neural_platform.core.trainer import Trainer
     from neural_platform.data.loader import build_dataloaders
+
+    # Mutually-exclusive resume flags. We surface a clear error rather than
+    # silently picking one — the two modes have very different semantics.
+    if resume_path and finetune_path:
+        console.print("[red]--resume and --finetune are mutually exclusive.[/] "
+                      "Pick one: --resume preserves optimizer state, --finetune drops it.")
+        sys.exit(2)
+
+    # --resume-from-best resolves a run name → checkpoint path. Mode follows
+    # whichever explicit flag was set; default to --resume if neither.
+    if resume_from_best:
+        if resume_path or finetune_path:
+            console.print("[red]--resume-from-best can't be combined with an explicit "
+                          "--resume / --finetune path.[/]")
+            sys.exit(2)
+        ckpt = _resolve_best_for_run(resume_from_best)
+        if not ckpt:
+            console.print(f"[red]No checkpoint_best.pt found for run '{resume_from_best}'.[/]")
+            sys.exit(2)
+        resume_path = ckpt   # default to full-state resume; users can pass --finetune explicitly
+
+    resume_target = resume_path or finetune_path
+    resume_mode = "weights_only" if finetune_path else "full"
 
     cfg = load_config(config)
 
@@ -363,9 +408,17 @@ def train(config: str, override: tuple, db: Optional[str]):
     console.print(f"  Val samples:   {n_val:,}")
     console.print()
 
+    if resume_target:
+        action = "Resuming" if resume_mode == "full" else "Fine-tuning"
+        console.print(f"[bold]{action} from:[/] {resume_target}")
+
     trainer = Trainer(cfg, db_path=db)
     try:
-        result = trainer.fit(train_loader, val_loader)
+        result = trainer.fit(
+            train_loader, val_loader,
+            resume_from=resume_target,
+            resume_mode=resume_mode,
+        )
     except Exception as e:
         console.print(f"[red]Training failed:[/] {e}")
         raise
@@ -438,9 +491,26 @@ def evaluate(config: str, checkpoint: Optional[str], split: str):
 @click.option("--host", default=None, help="Override bind host")
 @click.option("--port", "-p", default=None, type=int, help="Override bind port")
 @click.option("--reload", is_flag=True, help="Enable hot reload (dev)")
-def serve(config: str, checkpoint: Optional[str], host: Optional[str], port: Optional[int], reload: bool):
-    """Launch the REST inference server for a trained model."""
-    import uvicorn
+@click.option("--no-auth", is_flag=True,
+              help="Disable bearer-token auth. NOT recommended on shared networks.")
+@click.option("--no-checkpoint", is_flag=True,
+              help="Serve the model without loading a NeuralForge checkpoint. "
+                   "Only valid for hf_pipeline models — their weights come from "
+                   "HuggingFace at startup. Use this for zero-shot inference on a "
+                   "published HF model that you haven't fine-tuned locally.")
+def serve(config: str, checkpoint: Optional[str], host: Optional[str], port: Optional[int],
+          reload: bool, no_auth: bool, no_checkpoint: bool):
+    """Launch the REST inference server for a trained model.
+
+    By default the server requires `Authorization: Bearer <token>` on every
+    endpoint except /health. If `NEURAL_INFERENCE_TOKEN` is set the server
+    uses that; otherwise it generates a one-shot token at startup and prints
+    it to stderr. Pass `--no-auth` to disable auth entirely.
+
+    Pass `--no-checkpoint` for HuggingFace pipeline models when you want to
+    serve the published weights as-is, with no local training run behind them.
+    """
+    import os, uvicorn
     from neural_platform.core.config import load_config
     from neural_platform.deploy.server import create_inference_app
 
@@ -449,21 +519,56 @@ def serve(config: str, checkpoint: Optional[str], host: Optional[str], port: Opt
     bind_host = host or deploy_cfg.host
     bind_port = port or deploy_cfg.port
 
-    # Resolve checkpoint
-    if not checkpoint:
-        ckpt_dir = cfg.checkpoint_dir
-        best = ckpt_dir / "checkpoint_best.pt"
-        checkpoint = str(best) if best.exists() else None
+    # `--no-checkpoint` short-circuits the usual checkpoint resolution. The
+    # combination `--checkpoint X --no-checkpoint` is contradictory — refuse it.
+    if no_checkpoint and checkpoint:
+        console.print("[red]--checkpoint and --no-checkpoint are mutually exclusive.[/] "
+                      "Drop one.")
+        sys.exit(2)
 
-    if not checkpoint or not Path(checkpoint).exists():
-        console.print("[red]No checkpoint found. Run `neural train` first.[/]")
-        sys.exit(1)
+    if no_checkpoint:
+        if cfg.model.type.value != "hf_pipeline":
+            console.print(
+                f"[red]--no-checkpoint is only valid for hf_pipeline models, "
+                f"got '{cfg.model.type.value}'.[/] Other model types need a "
+                "NeuralForge checkpoint with trained weights."
+            )
+            sys.exit(2)
+        checkpoint = None
+    else:
+        # Resolve checkpoint
+        if not checkpoint:
+            ckpt_dir = cfg.checkpoint_dir
+            best = ckpt_dir / "checkpoint_best.pt"
+            checkpoint = str(best) if best.exists() else None
+
+        if not checkpoint or not Path(checkpoint).exists():
+            console.print("[red]No checkpoint found. Run `neural train` first, "
+                          "or pass --no-checkpoint for hf_pipeline models.[/]")
+            sys.exit(1)
+
+    if no_auth:
+        os.environ["NEURAL_INFERENCE_AUTH"] = "off"
 
     console.print(f"[bold green]NeuralForge Inference Server[/]")
     console.print(f"  Model:      {cfg.model.type.value} ({cfg.model.name})")
-    console.print(f"  Checkpoint: {checkpoint}")
+    if checkpoint:
+        console.print(f"  Checkpoint: {checkpoint}")
+    else:
+        pretrained = (cfg.model.hf_pipeline.pretrained
+                      if cfg.model.hf_pipeline else "(unknown)")
+        console.print(f"  Checkpoint: [yellow](none — serving HF weights for {pretrained})[/]")
     console.print(f"  Listening:  http://{bind_host}:{bind_port}")
-    console.print(f"  Docs:       http://{bind_host}:{bind_port}/docs\n")
+    console.print(f"  Docs:       http://{bind_host}:{bind_port}/docs")
+    auth_note = ("[red]disabled (--no-auth)[/]" if no_auth
+                 else "[green]bearer token (printed below if auto-generated)[/]")
+    console.print(f"  Auth:       {auth_note}\n")
+    if bind_host in ("0.0.0.0", "::") and no_auth:
+        console.print(
+            "[yellow]⚠ Binding 0.0.0.0 with --no-auth makes the inference server "
+            "reachable from any machine on this network without authentication. "
+            "Bind to 127.0.0.1 or drop --no-auth.[/]"
+        )
 
     app = create_inference_app(cfg, checkpoint)
     uvicorn.run(app, host=bind_host, port=bind_port, reload=reload)
@@ -634,6 +739,51 @@ def export(config: str, checkpoint: Optional[str], fmt: str, output: Optional[st
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _resolve_best_for_run(name_or_path: str) -> Optional[str]:
+    """Map a run name (e.g. ``imdb_lstm``) or run-dir path to its
+    ``checkpoints/checkpoint_best.pt`` if one exists.
+
+    Search order:
+      1. Treat the input as a path; if it points at a .pt file directly,
+         return it.
+      2. If it's a directory, look for ``checkpoints/checkpoint_best.pt`` and
+         then for the newest ``checkpoints/*.pt``.
+      3. Treat it as a run name under ``runs/<name>/checkpoints/...``.
+
+    Returns a string path if found, else None. The CLI surfaces a clear
+    error in the latter case.
+    """
+    candidate = Path(name_or_path)
+
+    # 1) Direct .pt path
+    if candidate.suffix == ".pt" and candidate.exists():
+        return str(candidate.resolve())
+
+    # 2) Directory
+    if candidate.is_dir():
+        best = candidate / "checkpoints" / "checkpoint_best.pt"
+        if best.exists():
+            return str(best.resolve())
+        ckpts = sorted((candidate / "checkpoints").glob("*.pt"),
+                       key=lambda p: p.stat().st_mtime, reverse=True) \
+                if (candidate / "checkpoints").is_dir() else []
+        if ckpts:
+            return str(ckpts[0].resolve())
+        return None
+
+    # 3) Bare run name → `runs/<name>/checkpoints/checkpoint_best.pt`
+    bare = Path("runs") / name_or_path / "checkpoints" / "checkpoint_best.pt"
+    if bare.exists():
+        return str(bare.resolve())
+    bare_dir = Path("runs") / name_or_path / "checkpoints"
+    if bare_dir.is_dir():
+        ckpts = sorted(bare_dir.glob("*.pt"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+        if ckpts:
+            return str(ckpts[0].resolve())
+    return None
+
 
 def _apply_overrides(cfg, overrides: tuple):
     """Apply --override key=value strings to a config."""

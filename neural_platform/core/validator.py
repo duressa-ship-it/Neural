@@ -81,7 +81,10 @@ class ValidationReport:
 # Public API
 # ---------------------------------------------------------------------------
 
-def validate_config(cfg: ExperimentConfig, check_deps: bool = True) -> ValidationReport:
+def validate_config(cfg: ExperimentConfig,
+                    check_deps: bool = True,
+                    check_remote: bool = True,
+                    check_resources: bool = True) -> ValidationReport:
     """
     Run a battery of cross-cutting checks that Pydantic alone can't catch.
     Returns a ValidationReport; callers decide whether to abort.
@@ -89,6 +92,15 @@ def validate_config(cfg: ExperimentConfig, check_deps: bool = True) -> Validatio
     `check_deps` (default True) runs the modality-specific package-availability
     audit (`core.deps`). Tests typically pass `check_deps=False` to keep
     configs validating cleanly even in environments missing optional packages.
+
+    `check_remote` (default True) reaches out to the HuggingFace Hub to ask
+    the model inspector whether the chosen model id agrees with the chosen
+    pipeline_task. This is the check that catches "openai/whisper-tiny +
+    imdb (text)" combos in milliseconds. Tests pass False to stay offline.
+
+    `check_resources` (default True) compares estimated model + dataset
+    footprint against host CPU/GPU/RAM/disk. Surfaces tight-fit warnings
+    and hard-blocks runs that obviously won't fit.
     """
     r = ValidationReport()
     _validate_identity(cfg, r)
@@ -98,6 +110,10 @@ def validate_config(cfg: ExperimentConfig, check_deps: bool = True) -> Validatio
     _validate_data_model_compat(cfg, r)
     if check_deps:
         _validate_dependencies(cfg, r)
+    if check_remote:
+        _validate_model_source(cfg, r)
+    if check_resources:
+        _validate_resource_fit(cfg, r)
     return r
 
 
@@ -421,6 +437,60 @@ def _validate_data_model_compat(cfg: ExperimentConfig, r: ValidationReport) -> N
             "`transformers`) or switch data.source to 'huggingface'.",
         )
 
+    # hf_pipeline + synthetic / random-feature sources don't make sense.
+    # Synthesized configs from the Predict tab's "Launch from HF" button
+    # always set data.source=synthetic (it's never read — the inference
+    # server owns the model). If a user picks one of those configs in the
+    # Train tab, they hit a runtime crash deep inside the embedding layer
+    # ("got MPSFloatType instead" / "Long, Int" expected). Catch it here
+    # so the error surfaces at validate time with an actionable hint.
+    if (
+        m.type == ModelType.HF_PIPELINE
+        and d.source in (DataSource.SYNTHETIC, DataSource.NUMPY, DataSource.CSV)
+    ):
+        ptask = (cfg.training.pipeline_task or "").lower()
+        text_pipelines = (
+            "text-classification", "token-classification",
+            "zero-shot-classification", "fill-mask", "text-generation",
+            "text2text-generation", "summarization", "translation",
+            "question-answering", "feature-extraction",
+        )
+        is_text_task = (
+            ptask in text_pipelines
+            or "text" in ptask
+            or "fill-mask" in ptask
+            or "translation" in ptask
+            or "summarization" in ptask
+        )
+        if is_text_task:
+            hint = (
+                "Switch data.source to 'huggingface' with a real text dataset "
+                "(e.g. dataset_name='imdb'), or — if you only meant to **serve** "
+                "this model, not train it — launch it from the Predict tab's "
+                "'Launch from HF' button instead. Synthesized server-only configs "
+                "live under runs/_hf_servers/ and aren't trainable."
+            )
+            r.add_error(
+                "data.source",
+                f"model.type='hf_pipeline' with pipeline_task='{ptask or 'text'}' "
+                f"expects tokenized text input, but data.source='{d.source.value}' "
+                "produces random feature tensors. The forward pass will crash "
+                "inside the embedding layer.",
+                hint,
+            )
+        else:
+            # Image / audio / multimodal pipelines could conceivably accept a
+            # numeric tensor of the right shape, but a synthetic source
+            # with default classification settings is still almost always
+            # wrong — surface as a warning, not an error.
+            r.add_warning(
+                "data.source",
+                f"model.type='hf_pipeline' with data.source='{d.source.value}' "
+                f"is unusual — most HF pipelines expect dataset-shaped inputs.",
+                "Switch to data.source='huggingface', or confirm your synthetic "
+                "tensors match the model's expected input shape exactly.",
+            )
+
     # CNN with non-image data
     if m.type == ModelType.CNN and d.source in (DataSource.CSV, DataSource.NUMPY, DataSource.SYNTHETIC):
         r.add_warning(
@@ -539,3 +609,196 @@ def _features_summary(features) -> dict:
     """
     from neural_platform.core.hf_introspect import inspect_features
     return inspect_features(features)
+
+
+# ---------------------------------------------------------------------------
+# Pluggable model-source compatibility check
+# ---------------------------------------------------------------------------
+
+def _validate_model_source(cfg: ExperimentConfig, r: ValidationReport) -> None:
+    """When the model is an `hf_pipeline`, ask the HF inspector whether
+    the chosen `pretrained` id is compatible with the chosen `pipeline_task`
+    and the dataset's modality.
+
+    Catches the canonical Whisper-vs-IMDB failure mode: user picks an
+    audio model and points it at a text task. The inspector reads the
+    model's `pipeline_tag` from the Hub and rejects the mismatch with a
+    pointer to the right model search.
+
+    Network problems degrade to silence: we don't want offline users to
+    be blocked from training a known-good config.
+    """
+    if cfg.model.type != ModelType.HF_PIPELINE:
+        return
+    pretrained = (cfg.model.hf_pipeline.pretrained or "").strip()
+    if not pretrained:
+        return
+    intended_task = (cfg.training.pipeline_task or "").strip() or None
+
+    # Detect dataset modality cheaply — reuse the introspect path.
+    dataset_modality = None
+    try:
+        if cfg.data.source == DataSource.HUGGINGFACE and cfg.data.dataset_name:
+            from datasets import load_dataset_builder
+            from neural_platform.core.hf_introspect import inspect_features
+            from neural_platform.core.modality import detect_from_features
+            builder = load_dataset_builder(cfg.data.dataset_name)
+            schema = inspect_features(getattr(builder.info, "features", None))
+            dataset_modality = detect_from_features(schema).value
+    except Exception:
+        dataset_modality = None
+
+    try:
+        from neural_platform.core.model_source import get_source
+        source = get_source("huggingface")
+        report = source.inspect_compat(
+            pretrained,
+            intended_task=intended_task,
+            dataset_modality=dataset_modality,
+        )
+    except Exception as exc:
+        r.add_warning(
+            "model.hf_pipeline.pretrained",
+            f"Could not query HuggingFace Hub for '{pretrained}': {exc}",
+            "Network/auth issue — proceeding without compatibility check.",
+        )
+        return
+
+    for issue in report.issues:
+        field_name = "model.hf_pipeline.pretrained"
+        if issue.code in ("task_modality_mismatch", "task_mismatch_same_modality"):
+            field_name = "training.pipeline_task"
+        elif issue.code == "auth_required":
+            field_name = "auth.HF_TOKEN"
+        if issue.severity == "error":
+            r.add_error(field_name, issue.message, issue.hint)
+        elif issue.severity == "warning":
+            r.add_warning(field_name, issue.message, issue.hint)
+
+
+# ---------------------------------------------------------------------------
+# Resource-fit pre-flight
+# ---------------------------------------------------------------------------
+
+def _validate_resource_fit(cfg: ExperimentConfig, r: ValidationReport) -> None:
+    """Estimate model + dataset footprint and compare against host resources.
+
+    Best-effort: we only have parameter counts for HF Pipeline and HF
+    Transformer models. For from-scratch models the trainer would need to
+    materialize the architecture to count params — that's a heavier check
+    we run later in `Trainer._sanity_check_first_batch`.
+    """
+    try:
+        from neural_platform.core.resource_fit import (
+            snapshot_host, estimate_model_footprint, add_dataset_footprint, check_fit,
+        )
+    except Exception:
+        return  # resource_fit module missing — silent skip
+
+    parameters = None
+    size_bytes = None
+    arch_hints: dict = {}    # hidden_size, num_layers, num_heads, sequence_length
+
+    def _harvest_arch_hints(info) -> None:
+        """Pull architecture sizes out of a HF config.json so the activation
+        estimate uses the rich (B×T×D×L) path instead of the lean fallback."""
+        cfg_block = info.config or {}
+        if not isinstance(cfg_block, dict):
+            return
+        for src_key, dst_key in [
+            ("hidden_size", "hidden_size"),
+            ("d_model", "hidden_size"),
+            ("num_hidden_layers", "num_layers"),
+            ("n_layer", "num_layers"),
+            ("num_layers", "num_layers"),
+            ("num_attention_heads", "num_heads"),
+            ("n_head", "num_heads"),
+            ("max_position_embeddings", "sequence_length"),
+        ]:
+            val = cfg_block.get(src_key)
+            if val and dst_key not in arch_hints:
+                try:
+                    arch_hints[dst_key] = int(val)
+                except (TypeError, ValueError):
+                    pass
+
+    # HF pipeline → ask the model source for the param count
+    if cfg.model.type == ModelType.HF_PIPELINE and cfg.model.hf_pipeline.pretrained:
+        try:
+            from neural_platform.core.model_source import get_source
+            info = get_source("huggingface").get_info(cfg.model.hf_pipeline.pretrained)
+            parameters = info.parameters
+            size_bytes = info.size_bytes
+            _harvest_arch_hints(info)
+        except Exception:
+            return  # offline / unauthorized — skip resource check silently
+
+    # Transformer with use_pretrained — same path
+    if cfg.model.type == ModelType.TRANSFORMER and cfg.model.transformer \
+       and cfg.model.transformer.use_pretrained:
+        try:
+            from neural_platform.core.model_source import get_source
+            info = get_source("huggingface").get_info(cfg.model.transformer.use_pretrained)
+            parameters = info.parameters
+            size_bytes = info.size_bytes
+            _harvest_arch_hints(info)
+        except Exception:
+            return
+
+    if not parameters and not size_bytes:
+        return  # nothing to estimate
+
+    # Cap sequence_length at what the user actually configured. HF models
+    # often advertise huge context windows (128K) that we won't actually use.
+    user_seq_len = None
+    if cfg.model.type == ModelType.TRANSFORMER and cfg.model.transformer:
+        user_seq_len = getattr(cfg.model.transformer, "max_seq_len", None) \
+            or getattr(cfg.model.transformer, "sequence_length", None)
+    transforms = cfg.data.transforms
+    if isinstance(transforms, dict) and transforms.get("text", {}).get("max_length"):
+        user_seq_len = transforms["text"]["max_length"]
+    if user_seq_len:
+        arch_hints["sequence_length"] = min(int(user_seq_len),
+                                              arch_hints.get("sequence_length", 1 << 30))
+    else:
+        # Default to 128 — the loader's default — so we don't size against 128K.
+        arch_hints.setdefault("sequence_length", 128)
+
+    # Dataset size from the HF builder (if available)
+    dataset_size = None
+    try:
+        if cfg.data.source == DataSource.HUGGINGFACE and cfg.data.dataset_name:
+            from datasets import load_dataset_builder
+            builder = load_dataset_builder(cfg.data.dataset_name)
+            dataset_size = getattr(builder.info, "dataset_size", None) \
+                or getattr(builder.info, "download_size", None)
+    except Exception:
+        dataset_size = None
+
+    host = snapshot_host()
+    est = estimate_model_footprint(
+        parameters=parameters, size_bytes=size_bytes,
+        purpose="training",
+        optimizer=cfg.training.optimizer.type.value if hasattr(cfg.training.optimizer.type, "value") else "adamw",
+        batch_size=cfg.training.batch_size,
+        sequence_length=arch_hints.get("sequence_length"),
+        hidden_size=arch_hints.get("hidden_size"),
+        num_layers=arch_hints.get("num_layers"),
+        num_heads=arch_hints.get("num_heads"),
+        dtype_bytes=2 if cfg.training.mixed_precision else 4,
+    )
+    est = add_dataset_footprint(est, dataset_size)
+    fit = check_fit(est, host, purpose="training", device=cfg.training.device)
+    for issue in fit.issues:
+        sev = issue.get("severity") or "warning"
+        msg = issue.get("message") or ""
+        hint = issue.get("hint")
+        field_name = (
+            "training.batch_size" if issue.get("code") in ("vram_tight", "vram_too_small")
+            else "data.dataset_name" if issue.get("code", "").startswith("disk")
+            else "model.hf_pipeline.pretrained"
+        )
+        if sev == "error":
+            r.add_error(field_name, msg, hint)
+        else:
+            r.add_warning(field_name, msg, hint)

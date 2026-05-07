@@ -305,17 +305,67 @@ def _hf_class_names(hf_dataset, label_col: Optional[str]) -> Optional[List[str]]
     return class_names_for(hf_dataset, label_col)
 
 
+def _looks_like_audio_decoder(audio) -> bool:
+    """
+    Duck-type check for `torchcodec.decoders.AudioDecoder`.
+
+    We avoid importing torchcodec to keep this module light — and resilient
+    to torchcodec being absent. The class exposes `get_all_samples`,
+    `get_samples_played_in_range_seconds`, and `metadata`; one is enough.
+    """
+    if isinstance(audio, (dict, str, bytes, bytearray)):
+        return False
+    return hasattr(audio, "get_all_samples") or hasattr(audio, "get_samples_played_in_range_seconds")
+
+
+def _decode_torchcodec_audio(decoder):
+    """
+    Pull samples out of a torchcodec AudioDecoder.
+
+    Returns `(waveform_tensor, sample_rate)` on success, or `(None, None)` if
+    the API shape was not what we expected — letting the caller fall through
+    to other decode paths.
+    """
+    try:
+        samples = decoder.get_all_samples()
+    except Exception:
+        return None, None
+
+    # torchcodec returns an `AudioSamples` namedtuple-ish with `.data`
+    # (Tensor of shape [channels, samples]) and `.sample_rate` (int).
+    data = getattr(samples, "data", None)
+    sr = getattr(samples, "sample_rate", None)
+    if data is None:
+        return None, None
+
+    if isinstance(data, torch.Tensor):
+        wav = data.detach().to(torch.float32)
+    else:
+        try:
+            wav = torch.tensor(np.asarray(data), dtype=torch.float32)
+        except Exception:
+            return None, None
+    try:
+        sr_int = int(sr) if sr is not None else None
+    except (TypeError, ValueError):
+        sr_int = None
+    return wav, sr_int
+
+
 def _coerce_waveform(audio, default_sr: int):
     """
     Turn a HuggingFace `Audio` cell into `(waveform_tensor, sample_rate)`.
 
     HF can return audio in *several* shapes depending on which decoders the
-    user has installed:
+    user has installed and which `datasets` version is in play:
       * `{'array': np.ndarray<float>, 'sampling_rate': int, 'path': str}`
         — the happy path, when soundfile/torchaudio is available.
       * `{'array': np.ndarray<object>, 'sampling_rate': int, 'bytes': bytes, ...}`
         — when the array couldn't be decoded; we need to decode `bytes`/`path`.
       * `{'bytes': bytes, 'path': str}` — raw, never decoded.
+      * `torchcodec.decoders.AudioDecoder` — what the new (datasets ≥ 3.0)
+        Audio feature returns when torchcodec is installed. Has
+        `.get_all_samples()` → `AudioSamples(.data, .sample_rate)`.
       * a bare ndarray, list of floats, or a string path.
 
     Always returns a float32 1D tensor and an integer sample rate.
@@ -325,6 +375,15 @@ def _coerce_waveform(audio, default_sr: int):
     bytes_blob = None
     path = None
     cell_keys: List[str] = []
+
+    # torchcodec AudioDecoder — what `datasets` ≥ 3.0 returns from an Audio
+    # feature when torchcodec is the active decoder backend. It's not a dict
+    # and doesn't expose `.array` directly. We pull samples via the documented
+    # API; if anything goes wrong we fall through to the legacy paths.
+    if _looks_like_audio_decoder(audio):
+        wav, decoded_sr = _decode_torchcodec_audio(audio)
+        if wav is not None:
+            return wav, decoded_sr or default_sr
 
     if isinstance(audio, dict):
         cell_keys = list(audio.keys())
@@ -339,6 +398,12 @@ def _coerce_waveform(audio, default_sr: int):
         path = audio
     elif isinstance(audio, (bytes, bytearray)):
         bytes_blob = bytes(audio)
+    elif hasattr(audio, "array") and hasattr(audio, "sampling_rate"):
+        # Object-style cell (some custom dataset features): treat attributes
+        # as the dict-equivalent fields.
+        cell_keys = ["array", "sampling_rate"]
+        sr = int(getattr(audio, "sampling_rate", None) or default_sr)
+        arr = getattr(audio, "array", None)
     else:
         arr = audio
 

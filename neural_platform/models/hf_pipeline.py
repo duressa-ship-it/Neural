@@ -106,6 +106,10 @@ class HFPipelineModel(BaseModel):
         # half, so callers may attach `_resolved_task` for us via the
         # adapter (see PyTorchAdapter.build_model).
         self._task: Optional[str] = getattr(config, "_resolved_task", None)
+        # Lazy-cached set of forward() parameter names (filled on first forward
+        # call). Initializing here avoids the AttributeError that bit us when
+        # `_filter_kwargs` referenced this before it existed.
+        self._fwd_param_names: Optional[set] = None
 
         try:
             import transformers
@@ -124,19 +128,89 @@ class HFPipelineModel(BaseModel):
                 f"'{self._task}'. Upgrade `transformers` or pick a different task."
             ) from exc
 
+        # `output_size` only makes sense for classification heads. For
+        # generative / non-classification tasks, passing `num_labels` either
+        # gets silently dropped or — worse — overrides the model's vocab head.
+        # `_resolve_auto_class_name` returns one of these classification
+        # AutoModel*ForSequenceClassification / *ForImageClassification etc.
+        # variants when the task is a classification task; in any other case,
+        # `num_labels` is meaningless and we drop it.
         load_kwargs: Dict[str, Any] = {}
         if arch.revision:           load_kwargs["revision"]          = arch.revision
         if arch.trust_remote_code:  load_kwargs["trust_remote_code"] = True
-        if arch.output_size:        load_kwargs["num_labels"]        = arch.output_size
-
+        if arch.output_size and arch.output_size > 0 and "Classification" in auto_name:
+            load_kwargs["num_labels"] = arch.output_size
+        # Pass the discovered HF token through `transformers` so gated repos
+        # work without the user having to plumb auth themselves. We resolve
+        # it from `core.hf_auth` (env or huggingface-cli cache) and only at
+        # call time — the token never lives on the model instance.
         try:
-            self.encoder = auto_cls.from_pretrained(arch.pretrained, **load_kwargs)
-        except Exception as exc:
+            from neural_platform.core.hf_auth import get_token as _hf_token
+            _t = _hf_token()
+            if _t:
+                load_kwargs["token"] = _t
+        except Exception:
+            pass
+
+        # Pre-flight: detect the loading pattern (PEFT / GGUF / diffusers /
+        # standard transformers) BEFORE we try to download the weights. This
+        # turns the cryptic "does not appear to have a file named
+        # pytorch_model.bin or model.safetensors" into a clear "this is a
+        # PEFT adapter, here's how to load it" error.
+        loading_pattern, base_model = _detect_repo_pattern(arch.pretrained)
+
+        if loading_pattern == "peft_adapter":
+            self.encoder = _load_peft_adapter(
+                adapter_id=arch.pretrained,
+                base_model=base_model,
+                auto_cls=auto_cls,
+                auto_name=auto_name,
+                load_kwargs=load_kwargs,
+            )
+        elif loading_pattern in ("gguf", "diffusers"):
             raise RuntimeError(
-                f"Could not load HF model '{arch.pretrained}' as {auto_name}: {exc}\n"
-                f"Hint: check that the model id is correct and the task matches "
-                f"the model's pipeline_tag on the Hub."
-            ) from exc
+                f"'{arch.pretrained}' is packaged as {loading_pattern}, which "
+                f"NeuralForge's HF wrapper can't load. "
+                + ("Use the original PyTorch checkpoint (the non-GGUF sibling repo) "
+                   "instead." if loading_pattern == "gguf"
+                   else "Diffusion pipelines load via the `diffusers` library, not transformers.")
+            )
+        else:
+            try:
+                self.encoder = auto_cls.from_pretrained(arch.pretrained, **load_kwargs)
+            except OSError as exc:
+                msg = _redact_msg(str(exc))
+                # Specific recovery for the "no recognized weight file"
+                # error: tell the user this is probably a PEFT adapter.
+                if "adapter_model" in msg or "adapter_config.json" in msg:
+                    raise RuntimeError(
+                        f"'{arch.pretrained}' looks like a PEFT/LoRA adapter "
+                        f"(only `adapter_*` files in the repo). Install `peft` "
+                        f"(`pip install peft`) and either point `pretrained` at "
+                        f"the base model, or wait for adapter-aware loading.",
+                    ) from exc
+                # Auth-specific failures: 401/403/gated. Give the user a
+                # clear, redacted hint instead of the raw HTTP soup.
+                if any(s in msg for s in ("401", "gated", "Restricted", "must have access")):
+                    raise RuntimeError(
+                        f"Access denied for '{arch.pretrained}'. The repo is gated "
+                        f"or restricted; your HF token doesn't have access. "
+                        f"Request access at https://huggingface.co/{arch.pretrained} "
+                        f"and re-run after the request is approved.\n"
+                        f"Hub said: {msg.splitlines()[0][:200]}"
+                    ) from exc
+                raise RuntimeError(
+                    f"Could not load HF model '{arch.pretrained}' as {auto_name}: {msg}\n"
+                    f"Hint: check that the model id is correct and the task matches "
+                    f"the model's pipeline_tag on the Hub."
+                ) from exc
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Could not load HF model '{arch.pretrained}' as {auto_name}: "
+                    f"{_redact_msg(str(exc))}\n"
+                    f"Hint: check that the model id is correct and the task matches "
+                    f"the model's pipeline_tag on the Hub."
+                ) from exc
 
         if arch.freeze_backbone:
             for param in self.encoder.parameters():
@@ -187,6 +261,11 @@ class HFPipelineModel(BaseModel):
         models take ``pixel_values``). Filtering against the actual sig
         means our generic dict-unpacking dataloader path works against any
         backbone without hand-coding a shim per model.
+
+        Note: we only do safe *name-only* renames (input_ids→input_features
+        is dropped — the data shapes are different). The renames here are
+        for fields like ``labels`` / ``label_ids`` that some HF models
+        accept under either name with the same shape.
         """
         if self._fwd_param_names is None:
             import inspect as _inspect
@@ -194,15 +273,20 @@ class HFPipelineModel(BaseModel):
                 sig = _inspect.signature(self.encoder.forward)
                 self._fwd_param_names = set(sig.parameters.keys())
             except (TypeError, ValueError):
-                self._fwd_param_names = None
+                self._fwd_param_names = set()
         if not self._fwd_param_names:
             return kwargs
 
-        filtered: Dict[str, Any] = {}
+        # Renames are *only* safe when the source and target hold tensors of
+        # the same shape (just a different attribute name). Cross-modality
+        # renames like input_ids→input_features are NOT safe because token
+        # IDs and mel-spectrogram features have completely different shapes,
+        # so we deliberately don't include them here. Modality mismatch is
+        # caught earlier by the validator + model inspector.
         renames = {
-            # Map common loader-side names to whatever the HF model expects.
-            "input_ids": "input_features",   # ASR/audio models prefer features
+            "label_ids": "labels",   # token-classification & some seq2seq models
         }
+        filtered: Dict[str, Any] = {}
         for k, v in kwargs.items():
             if k in self._fwd_param_names:
                 filtered[k] = v
@@ -210,3 +294,86 @@ class HFPipelineModel(BaseModel):
                 filtered[renames[k]] = v
             # else: silently drop — the model doesn't take this kwarg
         return filtered
+
+
+# ---------------------------------------------------------------------------
+# Loading-pattern probe + PEFT loader
+# ---------------------------------------------------------------------------
+
+def _redact_msg(msg: str) -> str:
+    """Scrub anything that looks like an HF token from an error string
+    before it surfaces to the user / logs / API. Falls back to the raw
+    string if the auth module can't be imported.
+    """
+    try:
+        from neural_platform.core.hf_auth import redact
+        return redact(msg)
+    except Exception:
+        return msg
+
+
+def _detect_repo_pattern(model_id: str):
+    """Cheap pre-flight pattern detection. Returns (pattern, base_model).
+
+    Uses the model source layer when available (which talks to the HF Hub
+    API). Falls back to ('unknown', None) on any error so the caller can
+    still attempt the standard load path.
+    """
+    try:
+        from neural_platform.core.model_source import get_source
+        info = get_source("huggingface").get_info(model_id)
+        return info.loading_pattern, info.base_model
+    except Exception:
+        return "unknown", None
+
+
+def _load_peft_adapter(adapter_id: str,
+                        base_model: Optional[str],
+                        auto_cls,
+                        auto_name: str,
+                        load_kwargs: Dict[str, Any]):
+    """Load a PEFT/LoRA adapter on top of its base model.
+
+    NeuralForge's HF wrapper hands us back the *merged* model so the rest of
+    the training/inference pipeline doesn't have to know it's an adapter.
+    The encoder is the base model with the adapter applied.
+
+    This requires both the base model id (parsed from `adapter_config.json`
+    by the model source layer) and the `peft` library installed.
+    """
+    if not base_model:
+        raise RuntimeError(
+            f"'{adapter_id}' is a PEFT/LoRA adapter but its base model couldn't "
+            "be discovered (no readable `adapter_config.json`). Either set "
+            "`pretrained` to the base model directly, or — if you have a local "
+            "copy of the adapter — point `pretrained` at the local path so the "
+            "loader can read `adapter_config.json` from disk."
+        )
+    try:
+        from peft import PeftModel  # type: ignore
+    except ImportError as exc:
+        raise ImportError(
+            f"'{adapter_id}' is a PEFT/LoRA adapter on top of '{base_model}'. "
+            "Loading requires the `peft` package: pip install peft"
+        ) from exc
+
+    # Load the base model first via the same Auto class the user requested,
+    # so heads / num_labels / classification configuration apply correctly.
+    try:
+        base = auto_cls.from_pretrained(base_model, **load_kwargs)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not load adapter base model '{base_model}' as {auto_name}: "
+            f"{exc}. The adapter '{adapter_id}' depends on this model loading "
+            "successfully."
+        ) from exc
+
+    try:
+        merged = PeftModel.from_pretrained(base, adapter_id)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Loaded base '{base_model}' but couldn't apply adapter "
+            f"'{adapter_id}': {exc}."
+        ) from exc
+
+    return merged

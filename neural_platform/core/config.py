@@ -374,8 +374,14 @@ class DataConfig(BaseModel):
 
 
 class DeployConfig(BaseModel):
-    """Inference server deployment configuration."""
-    host: str = Field("0.0.0.0", description="Server bind host")
+    """Inference server deployment configuration.
+
+    Binds to localhost by default — exposing the inference server to
+    other machines is opt-in (set `host: 0.0.0.0` in your config or pass
+    `--host 0.0.0.0` to `neural serve`). The CLI prints a security
+    warning when you do.
+    """
+    host: str = Field("127.0.0.1", description="Server bind host (default localhost-only)")
     port: int = Field(8080, ge=1024, le=65535, description="Server bind port")
     workers: int = Field(1, ge=1, description="Number of uvicorn workers")
     reload: bool = Field(False, description="Hot-reload (dev only)")

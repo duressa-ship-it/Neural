@@ -122,7 +122,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const isInput = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
 
     if ((e.metaKey || e.ctrlKey) && e.key === 'k') { e.preventDefault(); openPalette(); return; }
-    if (e.key === 'Escape') { closePalette(); closeDrawer(); closeHFBrowser(); return; }
+    if (e.key === 'Escape') { closePalette(); closeDrawer(); closeHFBrowser(); closeModelBrowser(); return; }
     if (isInput) return;
 
     // g-prefix shortcuts
@@ -337,11 +337,15 @@ function renderOverviewChart(exps) {
 async function initTrain() {
   await loadConfigs();
   initTrainLogModel();
+  await refreshTrainRuns();          // populate the multi-run table
   await refreshTrainLogs();
   connectTrainLogStream();
   await pollTrainStatus();
   if (State.trainPoll) clearInterval(State.trainPoll);
-  State.trainPoll = setInterval(pollTrainStatus, 3000);
+  State.trainPoll = setInterval(() => {
+    pollTrainStatus();
+    refreshTrainRuns();             // keep the runs list (and live chips) live
+  }, 3000);
 }
 function initTrainLogModel() {
   State.trainLogModel = {
@@ -590,15 +594,14 @@ async function startTraining() {
   startBtn.disabled = true;
   startBtn.innerHTML = '<span class="spin"></span> Starting…';
   try {
-    const res = await apiPost('/api/train/start', { config_path: path, overrides: getOverrides() });
-    document.getElementById('train-pid').textContent = res.pid;
-    document.getElementById('train-cmd').textContent = res.cmd;
-    document.getElementById('train-proc-info').classList.remove('hidden');
-    toast(`Training started (PID ${res.pid})`, 'success');
-    setTimeout(refreshTrainLogs, 1200);
+    // New multi-run endpoint: spawns concurrent runs without 409'ing.
+    const res = await apiPost('/api/train/runs/start',
+                              { config_path: path, overrides: getOverrides() });
+    State.selectedTrainRunId = res.id;
+    toast(`Training started: ${res.name} (PID ${res.pid})`, 'success');
+    setTimeout(() => { refreshTrainRuns(); refreshTrainLogs(); }, 600);
   } catch (e) {
-    // Try to parse a structured validation payload — the dashboard returns
-    // 422 with {detail: {message, issues:[...]}} when pre-flight fails.
+    // Pre-flight validation — same parsing as before.
     let parsed = null;
     try { parsed = JSON.parse(e.message); } catch {}
     if (parsed && parsed.issues) {
@@ -616,25 +619,111 @@ async function startTraining() {
       toast('Failed to start: ' + e.message, 'error', 5000);
     }
   } finally {
-    startBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5,3 19,12 5,21"/></svg> Start training`;
+    startBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5,3 19,12 5,21"/></svg> Start new run`;
+    startBtn.disabled = false;
     pollTrainStatus();
   }
 }
-async function stopTraining() {
-  if (!await confirmDialog('Stop the current training? This kills the subprocess and all DataLoader workers.')) return;
-  const stopBtn = document.getElementById('train-stop');
-  stopBtn.disabled = true;
-  stopBtn.innerHTML = '<span class="spin"></span> Stopping…';
+
+/* ----- Multi-run training: list + per-run stop + per-run log selection ----- */
+
+State.selectedTrainRunId = null;
+State.lastTrainRuns = [];
+
+async function refreshTrainRuns() {
+  const list = document.getElementById('train-runs-list');
+  if (!list) return;
   try {
-    const r = await apiPost('/api/train/stop');
-    if (r.stopped) toast(`Stopped (PID ${r.pid})`, 'success');
-    else toast(r.reason || 'Nothing to stop', 'info');
-  } catch (e) { toast('Stop failed: ' + e.message, 'error'); }
-  finally {
-    stopBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="6" y="6" width="12" height="12"/></svg> Stop`;
-    pollTrainStatus();
-    setTimeout(refreshTrainLogs, 800);
+    const runs = await api('/api/train/runs');
+    State.lastTrainRuns = runs;
+    if (!runs.length) {
+      list.innerHTML = '<div class="text-faint">No runs tracked yet. Start one above to see it here.</div>';
+      // Mirror to live tab
+      _renderLiveRunsChips([]);
+      return;
+    }
+    // Default selection: first running, else most recent.
+    if (!State.selectedTrainRunId || !runs.find(r => r.id === State.selectedTrainRunId)) {
+      const first = runs.find(r => r.status === 'running') || runs[0];
+      State.selectedTrainRunId = first.id;
+    }
+    list.innerHTML = runs.map(r => _renderTrainRunRow(r)).join('');
+    // Push the picker chips into the Live tab too — same data
+    _renderLiveRunsChips(runs);
+    // If the currently-selected run finished, refresh logs once more
+    refreshTrainLogs();
+  } catch (e) {
+    list.innerHTML = `<div class="text-faint">Could not load: ${escapeHtml(e.message || String(e))}</div>`;
   }
+}
+
+function _renderTrainRunRow(r) {
+  const dotCls = r.status === 'running' ? 'training'
+              : r.status === 'starting' ? 'training'
+              : r.status === 'failed'  ? 'error'
+              : r.status === 'exited'  ? 'online' : '';
+  const isSel = State.selectedTrainRunId === r.id;
+  const sel = isSel ? 'border:1px solid var(--accent);background:var(--bg-2)' : 'border:1px solid var(--border)';
+  return `
+    <div style="${sel};border-radius:6px;padding:8px;margin-bottom:6px;display:flex;align-items:center;gap:8px"
+         onclick="selectTrainRun('${escapeHtml(r.id)}')" role="button">
+      <span class="dot ${dotCls}"></span>
+      <div style="min-width:0;flex:1;cursor:pointer">
+        <div class="text-mono" style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(r.name)}</div>
+        <div class="text-faint" style="font-size:11px">
+          PID ${r.pid ?? '—'} · ${escapeHtml(r.status)}${r.exit_code != null ? ` (rc=${r.exit_code})` : ''} · started ${fmtAgo(r.started_at)}
+        </div>
+      </div>
+      <button class="btn btn-ghost btn-xs" onclick="event.stopPropagation();liveSwitchToRun('${escapeHtml(r.id)}')" title="Watch in Live tab">▶ Live</button>
+      ${r.status === 'running' || r.status === 'starting'
+        ? `<button class="btn btn-danger btn-xs" onclick="event.stopPropagation();stopRun('${escapeHtml(r.id)}')">Stop</button>`
+        : `<button class="btn btn-ghost btn-xs" onclick="event.stopPropagation();forgetRun('${escapeHtml(r.id)}')" title="Remove from list">✕</button>`}
+    </div>`;
+}
+
+function selectTrainRun(runId) {
+  State.selectedTrainRunId = runId;
+  // Re-render so the selection highlight moves.
+  refreshTrainRuns();
+}
+
+async function stopRun(runId) {
+  if (!await confirmDialog('Stop this run? Kills the subprocess and all DataLoader workers.')) return;
+  try {
+    await apiPost(`/api/train/runs/${encodeURIComponent(runId)}/stop`);
+    toast('Stop requested', 'success');
+  } catch (e) {
+    toast('Stop failed: ' + e.message, 'error');
+  } finally {
+    setTimeout(refreshTrainRuns, 500);
+  }
+}
+
+async function forgetRun(runId) {
+  try {
+    await apiPost(`/api/train/runs/${encodeURIComponent(runId)}/forget`);
+    if (State.selectedTrainRunId === runId) State.selectedTrainRunId = null;
+  } catch (e) { /* swallow */ }
+  refreshTrainRuns();
+}
+
+function fmtAgo(ts) {
+  if (!ts) return '—';
+  const sec = Math.max(0, (Date.now() / 1000) - ts);
+  if (sec < 60) return `${Math.round(sec)}s ago`;
+  if (sec < 3600) return `${Math.round(sec / 60)}m ago`;
+  if (sec < 86400) return `${Math.round(sec / 3600)}h ago`;
+  return `${Math.round(sec / 86400)}d ago`;
+}
+
+// Backwards-compat shim: stopTraining() used to stop the (single) running
+// process. Now it stops the currently-selected run from the runs list.
+async function stopTraining() {
+  if (!State.selectedTrainRunId) {
+    toast('Pick a run from the Training runs list first', 'info');
+    return;
+  }
+  await stopRun(State.selectedTrainRunId);
 }
 async function pollTrainStatus() {
   try {
@@ -659,15 +748,30 @@ async function pollTrainStatus() {
   } catch {}
 }
 async function refreshTrainLogs() {
+  // Multi-run aware: when a run is selected we tail its per-run log file.
+  // Falls back to the legacy shared log if no run is selected (e.g. on
+  // first page load before any spawn).
+  const sub = document.getElementById('train-log-sub');
   try {
-    const data = await api('/api/train/logs?chars=200000');
+    let data, label;
+    if (State.selectedTrainRunId) {
+      data = await api(`/api/train/runs/${encodeURIComponent(State.selectedTrainRunId)}/logs?chars=200000`);
+      const r = (State.lastTrainRuns || []).find(x => x.id === State.selectedTrainRunId);
+      label = r ? `Tailing ${r.name} · PID ${r.pid ?? '—'} · ${r.status}` : 'Tailing selected run';
+    } else {
+      data = await api('/api/train/logs?chars=200000');
+      label = 'Legacy shared log (no run selected)';
+    }
+    if (sub) sub.textContent = label;
     initTrainLogModel();
     if (data.text) processTrainLogChunk(data.text);
     renderTrainLogs();
     if (data.text && (!State.trainLogModel || State.trainLogModel.rows.join('').trim() === '')) {
       renderTrainLogsRawFallback(data.text);
     }
-  } catch {}
+  } catch (e) {
+    if (sub) sub.textContent = `Log fetch failed: ${e.message || e}`;
+  }
 }
 
 /* LIVE */
@@ -679,27 +783,97 @@ function newLiveState() {
     batches: [], epTrain: [], epVal: [], epAcc: [], epValAcc: [],
   };
 }
-async function initLive() { await connectLive(); }
+async function initLive() { await refreshLiveRuns(); await connectLive(); }
+
+State.liveRunId = null;       // currently-watched run id (null = legacy shared stream)
+State.lastLiveRuns = [];
+
+async function refreshLiveRuns() {
+  // Pull the canonical list from the manager. If at least one run exists
+  // and we haven't picked one yet, default to the first running (or first
+  // overall) so the chips strip + SSE both have a target.
+  try {
+    const runs = await api('/api/train/runs');
+    State.lastLiveRuns = runs;
+    _renderLiveRunsChips(runs);
+    if (!State.liveRunId || !runs.find(r => r.id === State.liveRunId)) {
+      const first = runs.find(r => r.status === 'running') || runs[0];
+      if (first) State.liveRunId = first.id;
+    }
+  } catch (e) {
+    State.lastLiveRuns = [];
+  }
+}
+
+function _renderLiveRunsChips(runs) {
+  const el = document.getElementById('live-runs-chips');
+  if (!el) return;
+  if (!runs || !runs.length) {
+    el.innerHTML = '<span class="text-faint text-xs">No runs tracked. Start one in the Train tab.</span>';
+    return;
+  }
+  el.innerHTML = runs.map(r => {
+    const sel = State.liveRunId === r.id;
+    const dotCls = r.status === 'running' ? 'training'
+                : r.status === 'failed'  ? 'error'
+                : r.status === 'exited'  ? 'online' : '';
+    return `
+      <button class="btn ${sel ? 'btn-primary' : 'btn-secondary'} btn-xs" type="button"
+              onclick="liveSwitchToRun('${escapeHtml(r.id)}')"
+              title="${escapeHtml(r.status)} · PID ${r.pid ?? '—'}">
+        <span class="dot ${dotCls}" style="margin-right:4px"></span>
+        ${escapeHtml(r.name)}
+      </button>`;
+  }).join('');
+}
+
+async function liveSwitchToRun(runId) {
+  // Switch the live tab to a different run. Tear down the prior SSE
+  // connection, reset chart state, then reconnect against the new run's
+  // per-run stream.
+  State.liveRunId = runId;
+  navigate('live');     // make sure user is on the page
+  if (State.liveES) { State.liveES.close(); State.liveES = null; }
+  await connectLive();
+  refreshLiveRuns();    // re-render chips so highlight moves
+}
+
 async function connectLive() {
   if (State.liveES) { State.liveES.close(); State.liveES = null; }
   State.liveState = newLiveState();
   initLiveCharts();
   setLiveStatus('connecting', 'Connecting…');
 
+  // Per-run stream when a run is selected; legacy shared stream otherwise
+  // (happens once on first page load before refreshLiveRuns has resolved).
+  const runId = State.liveRunId;
+  let snapUrl, sseUrl;
+  if (runId) {
+    snapUrl = `/api/train/runs/${encodeURIComponent(runId)}/events`;
+    sseUrl  = `/api/train/runs/${encodeURIComponent(runId)}/events/stream`;
+  } else {
+    snapUrl = '/api/training/live';
+    sseUrl  = '/api/events/stream';
+  }
+
   try {
-    const snap = await api('/api/training/live');
-    snap.events.forEach(ev => applyLiveEvent(ev, false));
-    if (!snap.is_running && (!State.liveState.experiment)) {
-      document.getElementById('live-empty').classList.remove('hidden');
+    const snap = await api(snapUrl);
+    (snap.events || []).forEach(ev => applyLiveEvent(ev, false));
+    if (!snap.is_running && !State.liveState.experiment) {
+      const empty = document.getElementById('live-empty');
+      if (empty) empty.classList.remove('hidden');
     }
   } catch {}
 
-  const es = new EventSource('/api/events/stream');
+  const es = new EventSource(sseUrl);
   State.liveES = es;
   ['training_start','batch','epoch','checkpoint','early_stop','training_end'].forEach(t => {
     es.addEventListener(t, e => applyLiveEvent(JSON.parse(e.data), true));
   });
-  es.addEventListener('connected', () => setLiveStatus('connected', 'Connected — waiting for run'));
+  es.addEventListener('connected', () => {
+    const r = (State.lastLiveRuns || []).find(x => x.id === runId);
+    setLiveStatus('connected', r ? `Watching ${r.name}` : 'Connected — waiting for run');
+  });
   es.onerror = () => setLiveStatus('error', 'Connection lost — retrying…');
 }
 function setLiveStatus(state, text) {
@@ -845,7 +1019,277 @@ function initBuilder() {
      'b-epochs','b-bs','b-lr','b-opt','b-sched','b-dev','b-data-source','b-val-split','b-test-split',
     ].forEach(id => { const el = document.getElementById(id); if (el) el.addEventListener('input', bRender); });
   }
+  // Browser/inspector wire-up is OUTSIDE the bWired guard so it re-attaches
+  // on every initBuilder call. Each call is idempotent — we tag the element
+  // with a `dataset.bound` flag and skip if already attached. This survives
+  // a stale `bWired=true` from a cached app.js that didn't include the
+  // browser code.
+  bWireModelBrowser();
   bRender();
+}
+
+/* ----- Idempotent wire-up for the HF model inspector + browser drawer ----- */
+function bWireModelBrowser() {
+  // Auto-inspect on pretrained id / task / dataset changes (debounced).
+  const pretrainedInput = document.getElementById('b-hf-pretrained');
+  if (pretrainedInput && !pretrainedInput.dataset.boundInspect) {
+    pretrainedInput.dataset.boundInspect = '1';
+    pretrainedInput.addEventListener('input', _bScheduleInspect);
+  }
+  const taskInput = document.getElementById('b-task');
+  if (taskInput && !taskInput.dataset.boundInspect) {
+    taskInput.dataset.boundInspect = '1';
+    taskInput.addEventListener('change', _bScheduleInspect);
+  }
+  const dsInput = document.getElementById('b-data-ds');
+  if (dsInput && !dsInput.dataset.boundInspect) {
+    dsInput.dataset.boundInspect = '1';
+    dsInput.addEventListener('change', _bScheduleInspect);
+  }
+  // Populate the drawer's source dropdown if empty (idempotent)
+  const sourceSel = document.getElementById('model-source');
+  if (sourceSel && !sourceSel.options.length) bLoadModelSources();
+  // Populate the drawer's task dropdown
+  const taskSel = document.getElementById('model-task');
+  if (taskSel && taskSel.options.length <= 1) _bPopulateTaskFilter(taskSel);
+}
+
+function _bPopulateTaskFilter(sel) {
+  // Reuse the task taxonomy already loaded for the Builder.
+  bLoadTasks().then(catalog => {
+    const meta = (catalog && catalog.meta) || {};
+    const tasks = Object.keys(meta).sort();
+    if (!tasks.length) return;
+    sel.innerHTML = '<option value="">Any task</option>' +
+      tasks.map(t => `<option value="${escapeHtml(t)}">${escapeHtml(t)}</option>`).join('');
+  }).catch(() => { /* offline — leave the default */ });
+}
+
+/* ----- Model Browser drawer (pluggable model source) ----- */
+
+let _bSourceList = null;
+let _bInspectTimer = null;
+let _modelSearchTimer = null;
+
+async function bLoadModelSources() {
+  const sel = document.getElementById('model-source');
+  if (!sel) return;
+  try {
+    _bSourceList = await api('/api/models/sources');
+  } catch (e) {
+    _bSourceList = [{ name: 'huggingface' }];
+  }
+  sel.innerHTML = _bSourceList
+    .map(s => `<option value="${escapeHtml(s.name)}">${escapeHtml(s.name)}</option>`)
+    .join('');
+}
+
+function openModelBrowser() {
+  document.getElementById('model-scrim').classList.add('show');
+  document.getElementById('model-drawer').classList.add('show');
+  // Make sure the source/task selects are populated.
+  bWireModelBrowser();
+  // Pre-fill query from whatever the user has typed in the pretrained box
+  const pretrained = (document.getElementById('b-hf-pretrained') || {}).value || '';
+  const q = document.getElementById('model-q');
+  if (q && !q.value) q.value = pretrained.split('/').pop() || '';
+  // Pre-select the task currently chosen in the Builder, since searching
+  // for models matching the current task is the common case.
+  const taskSel = document.getElementById('model-task');
+  const builderTask = (document.getElementById('b-task') || {}).value || '';
+  if (taskSel && builderTask && !taskSel.value) {
+    setTimeout(() => { taskSel.value = builderTask; modelRunSearch(); }, 50);
+  } else {
+    modelRunSearch();
+  }
+  setTimeout(() => document.getElementById('model-q')?.focus(), 100);
+}
+
+function closeModelBrowser() {
+  document.getElementById('model-scrim').classList.remove('show');
+  document.getElementById('model-drawer').classList.remove('show');
+}
+
+function modelDebouncedSearch() {
+  clearTimeout(_modelSearchTimer);
+  _modelSearchTimer = setTimeout(modelRunSearch, 300);
+}
+
+async function modelRunSearch() {
+  const out = document.getElementById('model-results');
+  const status = document.getElementById('model-status');
+  if (!out) return;
+  const q = (document.getElementById('model-q') || {}).value.trim();
+  const source = (document.getElementById('model-source') || {}).value || 'huggingface';
+  const task = (document.getElementById('model-task') || {}).value || '';
+  const sort = (document.getElementById('model-sort') || {}).value || 'downloads';
+
+  status.textContent = q ? `Searching ${source} for "${q}"…` : `Top ${source} models${task ? ` for ${task}` : ''}…`;
+  out.innerHTML = '<div class="empty"><span class="spin"></span></div>';
+
+  const params = new URLSearchParams({ source, sort, limit: '36' });
+  if (q) params.set('q', q);
+  if (task) params.set('task', task);
+  try {
+    const cards = await api('/api/models/search?' + params.toString());
+    if (!cards.length) {
+      out.innerHTML = `<div class="empty">No matches. Broaden the query or clear the task filter.</div>`;
+      status.textContent = `0 results from ${source}.`;
+      return;
+    }
+    out.innerHTML = cards.map(modelCard).join('');
+    status.textContent = `${cards.length}${cards.length >= 36 ? '+' : ''} result${cards.length === 1 ? '' : 's'}${task ? ` · task:${task}` : ''}.`;
+  } catch (e) {
+    out.innerHTML = `<div class="empty" style="color:var(--danger)">Search failed: ${escapeHtml(e.message || String(e))}</div>`;
+  }
+}
+
+function modelCard(c) {
+  const downloads = c.downloads
+    ? (c.downloads >= 1000 ? `${(c.downloads/1000).toFixed(1)}k` : c.downloads)
+    : '';
+  const tag = c.pipeline_tag ? `<span class="badge b-accent">${escapeHtml(c.pipeline_tag)}</span>` : '';
+  const mod = c.modality && c.modality !== 'unknown' ? `<span class="badge b-primary">${escapeHtml(c.modality)}</span>` : '';
+  const gated = c.gated ? `<span class="badge b-warning text-xs" title="Gated — needs HF token + access">gated</span>` : '';
+  const lib = c.library ? `<span class="text-faint text-xs" title="library_name">${escapeHtml(c.library)}</span>` : '';
+  const idEsc = escapeHtml(c.id).replace(/'/g, "\\'");
+  return `
+    <div class="hf-card">
+      <div class="between" style="margin-bottom:6px">
+        <div class="row-tight">
+          <span class="text-mono" style="color:var(--fg-strong);font-weight:600">${escapeHtml(c.id)}</span>
+          ${tag} ${mod} ${gated} ${lib}
+        </div>
+        <div class="row-tight text-xs text-muted">
+          ${downloads ? `↓ ${downloads}` : ''}
+          ${c.likes ? ` · ❤ ${c.likes}` : ''}
+        </div>
+      </div>
+      ${c.description ? `<div class="text-xs text-muted" style="margin-bottom:8px;line-height:1.5">${escapeHtml(c.description)}</div>` : ''}
+      <div class="row-tight">
+        <button class="btn btn-primary btn-xs" onclick="modelPick('${idEsc}')">Use this model</button>
+        <button class="btn btn-ghost btn-xs" onclick="window.open('https://huggingface.co/' + '${idEsc}', '_blank')">View on Hub ↗</button>
+      </div>
+    </div>`;
+}
+
+function modelPick(id) {
+  // Pin the id into the Builder's pretrained input, close the drawer, and
+  // fire the inspector so compatibility + resource fit show immediately.
+  const inp = document.getElementById('b-hf-pretrained');
+  if (inp) {
+    inp.value = id;
+    inp.dispatchEvent(new Event('input', {bubbles: true}));
+  }
+  closeModelBrowser();
+  setTimeout(() => bInspectCurrentModel(), 200);
+  toast(`Pinned ${id}`, 'success', 2000);
+}
+
+function _bScheduleInspect() {
+  if (_bInspectTimer) clearTimeout(_bInspectTimer);
+  _bInspectTimer = setTimeout(() => bInspectCurrentModel(), 600);
+}
+
+async function bInspectCurrentModel() {
+  const out = document.getElementById('b-hf-inspect');
+  if (!out) return;
+  const pretrained = (document.getElementById('b-hf-pretrained') || {}).value.trim();
+  if (!pretrained || bMtype !== 'hf_pipeline') {
+    out.classList.add('hidden');
+    return;
+  }
+  const task = (document.getElementById('b-task') || {}).value || '';
+  const dataset = (document.getElementById('b-data-ds') || {}).value || '';
+  out.classList.remove('hidden');
+  out.innerHTML = '<div class="text-muted">Inspecting model…</div>';
+  try {
+    const params = new URLSearchParams({ source: 'huggingface', id: pretrained });
+    if (task) params.set('task', task);
+    if (dataset) params.set('dataset', dataset);
+    const report = await api('/api/models/inspect?' + params.toString());
+
+    // Resource fit (best-effort)
+    let fitReport = null;
+    try {
+      const fparams = new URLSearchParams({ source: 'huggingface', id: pretrained, purpose: 'training' });
+      if (dataset) fparams.set('dataset', dataset);
+      fitReport = await api('/api/models/fit?' + fparams.toString());
+    } catch (_) { /* offline / unauth — skip */ }
+
+    out.innerHTML = bRenderInspectReport(report, fitReport);
+  } catch (e) {
+    out.innerHTML = `<div class="text-muted">Inspect failed: ${escapeHtml(e.message || String(e))}</div>`;
+  }
+}
+
+function bRenderInspectReport(report, fit) {
+  const issues = (report.issues || []).map(i => {
+    const cls = i.severity === 'error' ? 'b-warning' : (i.severity === 'warning' ? 'b-accent' : '');
+    return `
+      <div style="padding:6px 0;border-top:1px solid var(--border)">
+        <span class="badge ${cls} text-xs">${escapeHtml(i.severity)}</span>
+        <span style="margin-left:6px">${escapeHtml(i.message)}</span>
+        ${i.hint ? `<div class="text-faint mt-1">→ ${escapeHtml(i.hint)}</div>` : ''}
+      </div>`;
+  }).join('');
+  const okBanner = report.ok
+    ? `<span class="badge text-xs" style="background:#1f3a1f;color:#9af09a">compatible</span>`
+    : `<span class="badge b-warning text-xs">incompatible</span>`;
+  const summary = `
+    <div>
+      <strong>${escapeHtml(report.model_id)}</strong>
+      ${okBanner}
+      <span class="text-faint" style="margin-left:6px">declared: ${escapeHtml(report.detected_pipeline || '?')}</span>
+      ${report.intended_task ? `<span class="text-faint" style="margin-left:6px">intended: ${escapeHtml(report.intended_task)}</span>` : ''}
+    </div>`;
+  let fitBlock = '';
+  if (fit && fit.estimate) {
+    const est = fit.estimate;
+    const host = fit.host || {};
+    // Three-state badge: fits / won't fit / unknown (no params reported).
+    let fits;
+    if (fit.estimate_known === false) {
+      fits = `<span class="badge b-warning text-xs">unknown — no params reported</span>`;
+    } else if (fit.fits) {
+      fits = `<span class="badge text-xs" style="background:#1f3a1f;color:#9af09a">fits</span>`;
+    } else {
+      fits = `<span class="badge b-warning text-xs">won't fit</span>`;
+    }
+    fitBlock = `
+      <div class="mt-2 pt-2" style="border-top:1px solid var(--border)">
+        <div><strong>Resource fit:</strong> ${fits}</div>
+        <div class="text-faint mt-1">
+          weights ${_h(est.model_weight_b)} · grads ${_h(est.gradients_b)} · optim ${_h(est.optimizer_b)} ·
+          activations ${_h(est.activations_b)} · runtime ${_h(est.runtime_total_b)}
+        </div>
+        <div class="text-faint">
+          download ${_h(est.download_total_b)}
+          ${est.dataset_disk_b ? `(incl. dataset ${_h(est.dataset_disk_b)})` : ''}
+          · host ${escapeHtml(host.accelerator || 'cpu')}
+          ${host.vram_total_b ? `· VRAM ${_h(host.vram_total_b)}` : ''}
+          ${host.ram_total_b ? `· RAM ${_h(host.ram_total_b)}` : ''}
+          ${host.disk_free_b ? `· free disk ${_h(host.disk_free_b)}` : ''}
+        </div>
+      </div>`;
+    if (fit.issues && fit.issues.length) {
+      fitBlock += fit.issues.map(i => `
+        <div style="padding:6px 0;border-top:1px solid var(--border)">
+          <span class="badge ${i.severity === 'error' ? 'b-warning' : 'b-accent'} text-xs">${escapeHtml(i.severity)}</span>
+          <span style="margin-left:6px">${escapeHtml(i.message || '')}</span>
+          ${i.hint ? `<div class="text-faint mt-1">→ ${escapeHtml(i.hint)}</div>` : ''}
+        </div>`).join('');
+    }
+  }
+  return summary + (issues || '') + fitBlock;
+}
+
+function _h(n) {
+  if (n === null || n === undefined) return '?';
+  const u = ['B','KB','MB','GB','TB'];
+  let i = 0, f = Number(n) || 0;
+  while (f >= 1024 && i < u.length - 1) { f /= 1024; i++; }
+  return f.toFixed(1) + ' ' + u[i];
 }
 const B_MTYPE_PANELS = {
   mlp:         'b-mlp',
@@ -1713,14 +2157,287 @@ function initPredict() {
   const grid = document.getElementById('pg-mlp-grid');
   if (!grid.children.length) { for (let i = 0; i < 8; i++) pgAddMlpField(0); }
   initPredictLatencyChart();
+  ifRefresh();
 }
+
+/* ----- Managed inference servers (lifecycle UI) ----- */
+
+async function ifRefresh() {
+  const out = document.getElementById('if-list');
+  if (!out) return;
+  try {
+    const servers = await api('/api/inference/list');
+    if (!servers.length) {
+      out.innerHTML = '<div class="text-faint">No managed servers running. Click <strong>Launch new ↗</strong> to start one from a saved config.</div>';
+      return;
+    }
+    out.innerHTML = servers.map(ifRenderRow).join('');
+  } catch (e) {
+    out.innerHTML = `<div class="text-faint">Could not load: ${escapeHtml(e.message || String(e))}</div>`;
+  }
+}
+
+function ifRenderRow(s) {
+  const dotClass = s.status === 'running' ? 'online'
+                : s.status === 'starting' ? 'training'
+                : s.status === 'failed'   ? 'error'   : '';
+  const errLine = s.last_error
+    ? `<div class="text-faint mt-1">last log: ${escapeHtml(s.last_error)}</div>` : '';
+  // Source badge: 'HF' for HuggingFace launches, blank for checkpoint-backed
+  // servers (the existing flow). Helps the user spot which subprocesses are
+  // pulling weights from the Hub vs. their own runs.
+  const sourceBadge = s.source === 'huggingface'
+    ? `<span class="badge b-accent text-xs" title="Launched from HuggingFace${s.model_id ? ' — ' + s.model_id : ''}">HF</span>`
+    : '';
+  const sourceSub = (s.source === 'huggingface' && s.model_id)
+    ? `<div class="text-faint text-xs mt-1">HF: <code>${escapeHtml(s.model_id)}</code></div>`
+    : '';
+  return `
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 0;border-top:1px solid var(--border)">
+      <div style="min-width:0;flex:1">
+        <div class="row-tight">
+          <span class="dot ${dotClass}"></span>
+          <span class="text-mono" style="font-weight:600">${escapeHtml(s.name)}</span>
+          <span class="badge text-xs" style="margin-left:4px">${escapeHtml(s.status)}</span>
+          ${s.model_type ? `<span class="badge b-accent text-xs">${escapeHtml(s.model_type)}</span>` : ''}
+          ${sourceBadge}
+          <span class="text-faint text-xs">port ${s.port}</span>
+        </div>
+        ${sourceSub}
+        ${errLine}
+      </div>
+      <div class="row-tight">
+        <button class="btn btn-secondary btn-xs" onclick="ifPickServer('${escapeHtml(s.id)}', ${s.port})">Use</button>
+        <button class="btn btn-ghost btn-xs" onclick="ifStop('${escapeHtml(s.id)}')">Stop</button>
+      </div>
+    </div>`;
+}
+
+function ifPickServer(serverId, port) {
+  // Point the connect URL at the managed server. The proxy handles auth.
+  const inp = document.getElementById('pg-url');
+  if (inp) {
+    inp.value = `managed://${serverId}`;
+    pgConnect();
+  }
+}
+
+async function ifStop(serverId) {
+  try {
+    await apiPost(`/api/inference/${encodeURIComponent(serverId)}/stop`, {});
+    toast('Stopped', 'success');
+    ifRefresh();
+  } catch (e) {
+    toast('Stop failed: ' + (e.message || e), 'error', 4000);
+  }
+}
+
+/* Currently-selected source for the Launch drawer: 'config' or 'hf'.
+   Module-level so ifSwitchSource can update tab styling without juggling
+   classes through dataset attributes. */
+let _ifSource = 'config';
+
+async function ifOpenLaunch() {
+  document.getElementById('if-scrim').classList.add('show');
+  document.getElementById('if-drawer').classList.add('show');
+  // Default back to the config tab on each open so the drawer doesn't
+  // remember stale state from a prior failed HF launch.
+  ifSwitchSource('config');
+  // Populate the config dropdown from the existing /api/configs endpoint
+  const sel = document.getElementById('if-cfg-select');
+  if (sel) {
+    sel.innerHTML = '<option value="">Loading…</option>';
+    try {
+      const cfgs = await api('/api/configs');
+      sel.innerHTML = cfgs.length
+        ? cfgs.map(c => `<option value="${escapeHtml(c.path)}">${escapeHtml(c.name || c.path)}</option>`).join('')
+        : '<option value="">(no configs found — create one in Builder first)</option>';
+    } catch (e) {
+      sel.innerHTML = `<option value="">Failed to load: ${escapeHtml(e.message)}</option>`;
+    }
+  }
+}
+
+function ifSwitchSource(src) {
+  // Toggle the segmented control + show/hide the matching pane.
+  // Source values are 'config' (existing flow) and 'hf' (HuggingFace launcher).
+  _ifSource = src;
+  const cfgTab = document.getElementById('if-tab-config');
+  const hfTab  = document.getElementById('if-tab-hf');
+  const cfgPane = document.getElementById('if-pane-config');
+  const hfPane  = document.getElementById('if-pane-hf');
+  if (!cfgTab || !hfTab) return;
+  if (src === 'hf') {
+    hfTab.classList.remove('btn-ghost');
+    hfTab.classList.add('btn-secondary');
+    cfgTab.classList.remove('btn-secondary');
+    cfgTab.classList.add('btn-ghost');
+    if (cfgPane) cfgPane.classList.add('hidden');
+    if (hfPane)  hfPane.classList.remove('hidden');
+  } else {
+    cfgTab.classList.remove('btn-ghost');
+    cfgTab.classList.add('btn-secondary');
+    hfTab.classList.remove('btn-secondary');
+    hfTab.classList.add('btn-ghost');
+    if (cfgPane) cfgPane.classList.remove('hidden');
+    if (hfPane)  hfPane.classList.add('hidden');
+  }
+  const errEl = document.getElementById('if-launch-error');
+  if (errEl) errEl.classList.add('hidden');
+}
+
+function ifCloseLaunch() {
+  document.getElementById('if-scrim').classList.remove('show');
+  document.getElementById('if-drawer').classList.remove('show');
+}
+
+async function ifInspectHF() {
+  // Run the existing model inspector before launch so the user sees task /
+  // resource fit issues without burning a subprocess slot on a model that
+  // would have been blocked anyway.
+  const id = document.getElementById('if-hf-id').value.trim();
+  const task = document.getElementById('if-hf-task').value;
+  const out = document.getElementById('if-hf-inspect');
+  if (!id) {
+    out.classList.remove('hidden');
+    out.style.color = 'var(--danger)';
+    out.textContent = 'Paste an HF model id first.';
+    return;
+  }
+  out.classList.remove('hidden');
+  out.style.color = 'var(--fg-muted)';
+  out.textContent = 'Inspecting…';
+  try {
+    // The inspect endpoint expects ?source=&id=&task= — note the param name
+    // is `id`, not `model_id` (the Builder uses the same shape).
+    const params = new URLSearchParams({ source: 'huggingface', id, task });
+    const rep = await api(`/api/models/inspect?${params.toString()}`);
+    const issues = rep.issues || [];
+    const errs = issues.filter(i => i.severity === 'error');
+    const warns = issues.filter(i => i.severity === 'warning');
+    if (!issues.length) {
+      out.style.color = 'var(--success)';
+      out.innerHTML = `✓ Inspector found no issues. Task <code>${escapeHtml(task)}</code> looks compatible with <code>${escapeHtml(id)}</code>.`;
+    } else {
+      const fmt = (i) => `${i.severity === 'error' ? '✗' : '⚠'} <strong>${escapeHtml(i.code || i.severity)}</strong>: ${escapeHtml(i.message || '')}`;
+      out.style.color = errs.length ? 'var(--danger)' : 'var(--warning)';
+      out.innerHTML = [...errs, ...warns].map(fmt).join('<br>');
+    }
+  } catch (e) {
+    out.style.color = 'var(--danger)';
+    out.textContent = 'Inspect failed: ' + (e.message || String(e));
+  }
+}
+
+async function ifLaunch() {
+  const errEl = document.getElementById('if-launch-error');
+  errEl.classList.add('hidden');
+  const name = document.getElementById('if-name').value.trim() || null;
+
+  try {
+    let info;
+    if (_ifSource === 'hf') {
+      // HuggingFace launch — synthesizes config + spawns serve --no-checkpoint.
+      const id = document.getElementById('if-hf-id').value.trim();
+      const task = document.getElementById('if-hf-task').value;
+      const trust = document.getElementById('if-hf-trust').checked;
+      if (!id) {
+        errEl.textContent = 'Paste an HF model id first.';
+        errEl.classList.remove('hidden');
+        return;
+      }
+      info = await apiPost('/api/inference/start_hf', {
+        hf_model_id: id,
+        pipeline_task: task,
+        name,
+        trust_remote_code: trust,
+      });
+    } else {
+      // Existing config-driven launch.
+      const cfgPath = document.getElementById('if-cfg-select').value;
+      const ckpt = document.getElementById('if-ckpt').value.trim() || null;
+      if (!cfgPath) {
+        errEl.textContent = 'Pick a config first.';
+        errEl.classList.remove('hidden');
+        return;
+      }
+      info = await apiPost('/api/inference/start',
+                            { config_path: cfgPath, checkpoint: ckpt, name });
+    }
+    toast(`Launched ${info.name} on port ${info.port}`, 'success');
+    ifCloseLaunch();
+    setTimeout(ifRefresh, 600);
+    setTimeout(ifRefresh, 2000);   // re-poll once it's likely loaded
+  } catch (e) {
+    errEl.textContent = e.message || String(e);
+    errEl.classList.remove('hidden');
+  }
+}
+function _pgManagedId(url) {
+  // Recognize the `managed://<server_id>` form and return the id.
+  // For these, we route all traffic through the dashboard's secure proxy
+  // (`/api/inference/<id>/...`) — no token needed from the browser.
+  // Plain `http://...` URLs go through the public proxy and may need an
+  // explicit bearer token (paste in the Token field).
+  if (typeof url !== 'string') return null;
+  const m = url.match(/^managed:\/\/([A-Za-z0-9_-]+)$/);
+  return m ? m[1] : null;
+}
+
+// In-memory only. Never persisted to localStorage / sessionStorage so a
+// reload clears it and the token can't be exfiltrated by a same-origin
+// scripts that read storage. The actual transmit happens via the
+// Authorization header through the dashboard's proxy.
+let _pgBearerToken = null;
+
+function _pgReadToken() {
+  const el = document.getElementById('pg-token');
+  const v = el ? el.value.trim() : '';
+  // Cache in JS variable so subsequent requests work even if the user
+  // clears the field (the variable is the source of truth — we re-sync
+  // from the field on each call so the user can update it).
+  if (v) _pgBearerToken = v;
+  return _pgBearerToken;
+}
+
+function pgClearToken() {
+  _pgBearerToken = null;
+  const el = document.getElementById('pg-token');
+  if (el) el.value = '';
+  toast('Token cleared', 'success', 1500);
+}
+
+function pgToggleToken() {
+  const el = document.getElementById('pg-token');
+  if (!el) return;
+  el.type = el.type === 'password' ? 'text' : 'password';
+}
+
+function _pgAuthHeaders() {
+  // Build the headers object used for every proxy call. The token is
+  // sent ONLY in the Authorization header — never as a URL param, never
+  // in JSON bodies — so it doesn't end up in browser history, server
+  // access logs, or referer headers.
+  const t = _pgReadToken();
+  return t ? { 'Authorization': 'Bearer ' + t } : {};
+}
+
 async function pgConnect() {
   const url = document.getElementById('pg-url').value.trim();
   if (!url) return;
   pgSetStatus('connecting', 'Connecting…');
   try {
-    await api(`/api/proxy/health?server_url=${encodeURIComponent(url)}`);
-    const info = await api(`/api/proxy/info?server_url=${encodeURIComponent(url)}`);
+    const managed = _pgManagedId(url);
+    let info;
+    if (managed) {
+      // Managed server — the dashboard manager attaches its own token
+      // server-side; the browser doesn't need to handle one.
+      info = await api(`/api/inference/${encodeURIComponent(managed)}/info`);
+    } else {
+      const headers = _pgAuthHeaders();
+      await api(`/api/proxy/health?server_url=${encodeURIComponent(url)}`, { headers });
+      info = await api(`/api/proxy/info?server_url=${encodeURIComponent(url)}`, { headers });
+    }
     pgSetStatus('ok', 'Connected');
     document.getElementById('pg-run').disabled = false;
     pgShowInfo(info);
@@ -1730,7 +2447,14 @@ async function pgConnect() {
   } catch (e) {
     pgSetStatus('err', 'Cannot reach server');
     document.getElementById('pg-run').disabled = true;
-    toast('Connect failed: ' + e.message, 'error', 5000);
+    // Surface the 401 case clearly: the user knows to paste a token.
+    const msg = (e.message || String(e));
+    if (/401|unauthor|bearer/i.test(msg)) {
+      toast('Server requires a bearer token — paste it in the Token field.',
+            'error', 6000);
+    } else {
+      toast('Connect failed: ' + msg, 'error', 5000);
+    }
   }
 }
 function pgSetStatus(state, text) {
@@ -1768,10 +2492,26 @@ function pgShowInfo(info) {
 function pgSetType(type) {
   if (!type) return;
   pgType = type;
-  ['mlp-input', 'cnn-input', 'rnn-input', 'tx-input'].forEach(id => {
+  // Hide every input panel; the right one is unhidden below.
+  [
+    'mlp-input', 'cnn-input', 'rnn-input', 'tx-input',
+    'audio-input', 'tabular-input', 'video-input', 'hf-input',
+  ].forEach(id => {
     const el = document.getElementById('pg-' + id); if (el) el.classList.add('hidden');
   });
-  const map = { mlp: 'pg-mlp-input', cnn: 'pg-cnn-input', rnn: 'pg-rnn-input', transformer: 'pg-tx-input' };
+  // Map each model type to the panel that knows how to collect input for it.
+  // Unknown types fall through to MLP (a safe "list of floats" default).
+  const map = {
+    mlp:         'pg-mlp-input',
+    cnn:         'pg-cnn-input',
+    rnn:         'pg-rnn-input',
+    transformer: 'pg-tx-input',
+    audio_cnn:   'pg-audio-input',
+    tcn:         'pg-rnn-input',          // TCN takes the same sequence shape as RNN
+    tabular:     'pg-tabular-input',
+    video_cnn:   'pg-video-input',
+    hf_pipeline: 'pg-hf-input',
+  };
   document.getElementById(map[type] || 'pg-mlp-input').classList.remove('hidden');
 }
 function pgAddMlpField(val) {
@@ -1807,26 +2547,117 @@ async function pgRun() {
       if (!pgImageB64) throw new Error('Please select an image first');
       payload.image_b64 = pgImageB64;
     } else if (pgType === 'transformer') {
-      const tokens = document.getElementById('pg-tokens')?.value.trim();
-      if (!tokens) throw new Error('Enter pre-tokenized IDs (comma-separated)');
-      const arr = tokens.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
-      if (!arr.length) throw new Error('No valid token IDs found');
-      payload.tokens = arr;
-    } else if (pgType === 'rnn') {
+      // Prefer raw text (server tokenizes) — fall back to pre-tokenized IDs.
+      const text = document.getElementById('pg-text')?.value.trim() || '';
+      const tokens = document.getElementById('pg-tokens')?.value.trim() || '';
+      if (text) {
+        payload.text = text;
+      } else if (tokens) {
+        const arr = tokens.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+        if (!arr.length) throw new Error('No valid token IDs found');
+        payload.tokens = arr;
+      } else {
+        throw new Error('Enter text or pre-tokenized IDs.');
+      }
+    } else if (pgType === 'rnn' || pgType === 'tcn') {
       const raw = document.getElementById('pg-rnn').value.trim();
-      if (!raw) throw new Error('Enter sequence data');
+      if (!raw) throw new Error('Enter sequence data — one timestep per line.');
       const rows = raw.split('\n').map(r => r.trim()).filter(Boolean);
       const parsed = rows.map(r => {
         const vals = r.split(',').map(v => parseFloat(v.trim())).filter(v => !isNaN(v));
         return vals.length === 1 ? vals[0] : vals;
       });
+      // Reject the case the user just hit on: rows that parse to empty
+      // arrays make the server's PredictRequest validator reject the whole
+      // payload with a confusing "Input should be a valid number" error.
+      const empty = parsed.filter(r => Array.isArray(r) && !r.length);
+      if (empty.length) {
+        throw new Error(
+          `${empty.length} row(s) had no valid numbers. Use comma-separated `
+          + `floats per line, e.g. "0.1, 0.5, 0.9".`,
+        );
+      }
       payload.inputs = parsed;
+    } else if (pgType === 'audio_cnn') {
+      const raw = document.getElementById('pg-audio').value.trim();
+      if (!raw) throw new Error('Paste waveform samples (comma-separated floats).');
+      const arr = raw.split(/[\s,]+/).map(parseFloat).filter(v => !isNaN(v));
+      if (!arr.length) throw new Error('No valid audio samples parsed.');
+      payload.inputs = arr;
+    } else if (pgType === 'tabular') {
+      const num = document.getElementById('pg-tab-numeric').value.trim();
+      const cat = document.getElementById('pg-tab-categorical').value.trim();
+      const numArr = num ? num.split(',').map(parseFloat).filter(v => !isNaN(v)) : [];
+      const catArr = cat ? cat.split(',').map(parseInt).filter(v => !isNaN(v))   : [];
+      if (!numArr.length && !catArr.length) {
+        throw new Error('Enter at least one numeric or categorical feature.');
+      }
+      payload.inputs = { numeric: numArr, categorical: catArr };
+    } else if (pgType === 'video_cnn') {
+      const raw = document.getElementById('pg-video').value.trim();
+      if (!raw) throw new Error('Paste a 4D nested list (JSON) for the video tensor.');
+      try {
+        payload.inputs = JSON.parse(raw);
+      } catch (e) {
+        throw new Error('Video tensor must be valid JSON (4D nested list).');
+      }
+    } else if (pgType === 'hf_pipeline') {
+      const text = document.getElementById('pg-hf-text').value.trim();
+      const audio = document.getElementById('pg-hf-audio').value.trim();
+      if (text) {
+        payload.text = text;
+      } else if (audio) {
+        const arr = audio.split(/[\s,]+/).map(parseFloat).filter(v => !isNaN(v));
+        if (!arr.length) throw new Error('No valid audio samples parsed.');
+        payload.inputs = arr;
+      } else if (pgImageB64) {
+        payload.image_b64 = pgImageB64;
+      } else {
+        throw new Error("Pick one input: text, audio waveform, or upload an image.");
+      }
     } else {
-      payload.inputs = [...document.querySelectorAll('#pg-mlp-grid input')].map(el => parseFloat(el.value) || 0);
+      // MLP / fallback: collect numbers from the grid. Reject if nothing was
+      // typed — empty list goes to /predict and surfaces the cryptic "Input
+      // should be a valid number" error.
+      const cells = [...document.querySelectorAll('#pg-mlp-grid input')];
+      if (!cells.length) {
+        throw new Error("No input fields rendered. Try clicking + Field above.");
+      }
+      const arr = cells.map(el => {
+        const v = parseFloat(el.value);
+        return isNaN(v) ? 0 : v;
+      });
+      payload.inputs = arr;
     }
 
     pgLastReq = { ...payload };
-    const res = await apiPost('/api/proxy/predict', payload);
+    // For managed servers, route through the dashboard's secure proxy so
+    // the per-server bearer token never reaches the browser. The body is
+    // the same PredictRequest shape, minus `server_url` (which is implied
+    // by the path). For external servers, attach the token via the
+    // Authorization header (never in the body / URL).
+    const managedId = _pgManagedId(url);
+    let res;
+    if (managedId) {
+      const t0 = performance.now();
+      const raw = await apiPost(
+        `/api/inference/${encodeURIComponent(managedId)}/predict`,
+        { ...payload, server_url: undefined }
+      );
+      const wall = performance.now() - t0;
+      res = {
+        ...raw,
+        wall_latency_ms: wall,
+        latency_ms: raw.latency_ms,
+        raw,
+      };
+    } else {
+      res = await api('/api/proxy/predict', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ..._pgAuthHeaders() },
+        body: JSON.stringify(payload),
+      });
+    }
     pgLastRes = res;
 
     document.getElementById('pg-latency').textContent =
@@ -1836,12 +2667,42 @@ async function pgRun() {
     document.getElementById('pg-json-res').textContent = JSON.stringify(res.raw, null, 2);
     pushLatencyPoint(res.wall_latency_ms);
   } catch (e) {
-    errEl.textContent = e.message;
+    errEl.textContent = _pgFormatError(e);
     errEl.classList.remove('hidden');
+    // Also surface the request payload so the user can see exactly what
+    // was sent — the previous "input: []" 422s were impossible to debug
+    // without this.
+    try {
+      document.getElementById('pg-json-req').textContent = JSON.stringify(payload, null, 2);
+    } catch (_) {}
   } finally {
     btn.disabled = false;
     btn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5,3 19,12 5,21"/></svg> Run prediction`;
   }
+}
+
+function _pgFormatError(e) {
+  // FastAPI/Pydantic errors surface as JSON in `e.message`. Render them as
+  // a readable bullet list instead of dumping raw JSON like
+  // `[{"type":"float_type","loc":[...],"input":[]}]` (which is what bit
+  // the user). Falls back to the raw message for non-JSON errors.
+  const raw = (e && e.message) || String(e);
+  let parsed = null;
+  try { parsed = JSON.parse(raw); } catch (_) { return raw; }
+  const arr = Array.isArray(parsed) ? parsed
+            : (parsed && Array.isArray(parsed.detail) ? parsed.detail : null);
+  if (arr) {
+    return arr.slice(0, 12).map(d => {
+      const loc = Array.isArray(d.loc)
+        ? d.loc.filter(x => x !== 'body').join('.')
+        : '?';
+      const got = d.input !== undefined
+        ? `  (got: ${JSON.stringify(d.input).slice(0, 80)})` : '';
+      return `• ${loc}: ${d.msg}${got}`;
+    }).join('\n');
+  }
+  if (parsed && parsed.detail) return String(parsed.detail);
+  return raw;
 }
 function pgRenderResults(res) {
   const empty = document.getElementById('pg-empty');

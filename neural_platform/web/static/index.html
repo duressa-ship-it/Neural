@@ -69,6 +69,10 @@
       <span class="nav-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg></span>
       CLI Reference
     </div>
+    <a class="nav-item" href="/api/docs" target="_blank" rel="noopener">
+      <span class="nav-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="15" y2="17"/></svg></span>
+      API Docs ↗
+    </a>
     <div class="nav-item" data-page="settings">
       <span class="nav-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span>
       Settings
@@ -280,17 +284,24 @@ neural init --model transformer --name text_classifier</div>
         <div class="row mt-3">
           <button class="btn btn-primary" id="train-start" onclick="startTraining()" disabled>
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5,3 19,12 5,21"/></svg>
-            Start training
-          </button>
-          <button class="btn btn-danger" id="train-stop" onclick="stopTraining()" disabled>
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="6" y="6" width="12" height="12"/></svg>
-            Stop
+            Start new run
           </button>
           <button class="btn btn-ghost btn-sm" onclick="navigate('live')">Live view →</button>
         </div>
-        <div id="train-proc-info" class="hidden mt-4">
-          <div class="text-xs text-muted mb-2">PID <span class="text-mono" style="color:var(--fg)" id="train-pid">—</span></div>
-          <div class="code-block text-xs" id="train-cmd" style="font-size:11.5px">—</div>
+        <div class="text-xs text-faint mt-2">Multiple runs can run side by side. Pick one below to view its log or stop it.</div>
+      </div>
+
+      <!-- Active runs registry — replaces the single train-proc-info card -->
+      <div class="card mb-3">
+        <div class="card-head">
+          <div>
+            <div class="card-title">Training runs</div>
+            <div class="card-sub">Concurrent runs with per-run logs and stop control</div>
+          </div>
+          <button class="btn btn-ghost btn-sm" onclick="refreshTrainRuns()">↻</button>
+        </div>
+        <div id="train-runs-list" class="text-xs">
+          <div class="text-faint">No runs tracked yet. Start one above to see it here.</div>
         </div>
       </div>
 
@@ -298,11 +309,11 @@ neural init --model transformer --name text_classifier</div>
         <div class="card-head">
           <div>
             <div class="card-title">Subprocess output</div>
-            <div class="card-sub">Live tail of stdout/stderr</div>
+            <div class="card-sub" id="train-log-sub">Pick a run above to tail its log</div>
           </div>
           <button class="btn btn-ghost btn-sm" onclick="refreshTrainLogs()">↻</button>
         </div>
-        <div id="train-log" class="log-pane" style="white-space:pre-wrap">Subprocess output will appear here after training starts…</div>
+        <div id="train-log" class="log-pane" style="white-space:pre-wrap">Subprocess output will appear here after a run is selected…</div>
       </div>
     </div>
   </div>
@@ -313,12 +324,24 @@ neural init --model transformer --name text_classifier</div>
   <div class="page-h">
     <div>
       <h1 class="page-title">Live training</h1>
-      <p class="page-sub">Real-time metrics streamed from the active subprocess.</p>
+      <p class="page-sub">Real-time metrics streamed from a selected run. Switch runs from the chip strip below.</p>
     </div>
     <div class="row">
       <div class="topbar-status"><span class="dot" id="live-dot"></span><span id="live-text">Disconnected</span></div>
       <button class="btn btn-secondary btn-sm" onclick="connectLive()">Reconnect</button>
-      <button class="btn btn-danger btn-sm hidden" id="live-stop-btn" onclick="stopFromLive()">Stop training</button>
+      <button class="btn btn-danger btn-sm hidden" id="live-stop-btn" onclick="stopFromLive()">Stop this run</button>
+    </div>
+  </div>
+
+  <!-- Run picker — populated from /api/train/runs. Each chip switches the
+       SSE stream + log tail for the Live view. -->
+  <div class="card mb-3" id="live-runs-card">
+    <div class="card-head">
+      <div class="card-title">Pick a run to watch</div>
+      <button class="btn btn-ghost btn-sm" onclick="refreshLiveRuns()">↻</button>
+    </div>
+    <div id="live-runs-chips" class="row-tight" style="flex-wrap:wrap;gap:6px">
+      <span class="text-faint text-xs">No runs tracked. Start one in the Train tab.</span>
     </div>
   </div>
 
@@ -569,9 +592,16 @@ neural init --model transformer --name text_classifier</div>
           </div>
           <div class="field">
             <label class="label">Pretrained model id</label>
-            <input class="input input-mono" id="b-hf-pretrained" placeholder="openai/whisper-tiny" />
+            <div style="display:flex;gap:6px">
+              <input class="input input-mono" id="b-hf-pretrained" placeholder="openai/whisper-tiny" style="flex:1" />
+              <button type="button" class="btn btn-secondary btn-xs" onclick="openModelBrowser()">Browse ↗</button>
+            </div>
             <div class="text-xs text-faint mt-2">e.g. <code>facebook/wav2vec2-base</code>, <code>google/vit-base-patch16-224</code>, <code>bert-base-uncased</code></div>
           </div>
+
+          <!-- Live compatibility / resource-fit panel -->
+          <div id="b-hf-inspect" class="text-xs mb-3 hidden" style="border:1px solid var(--border);border-radius:6px;padding:8px;background:var(--bg-2)"></div>
+
           <div class="grid grid-2">
             <div><label class="label">Output classes (optional)</label><input class="input" id="b-hf-output" type="number" placeholder="auto" /></div>
             <div><label class="label">Freeze backbone</label>
@@ -730,13 +760,37 @@ neural init --model transformer --name text_classifier</div>
 
 <!-- ── Predict ── -->
 <section class="page" id="page-predict">
-  <div class="page-h"><div><h1 class="page-title">Predict</h1><p class="page-sub">Connect to an inference server (started with <code>neural serve</code>) and run live predictions.</p></div></div>
+  <div class="page-h"><div><h1 class="page-title">Predict</h1><p class="page-sub">Spin up an inference server from a checkpoint, or connect to one running elsewhere.</p></div></div>
+
+  <!-- Managed inference servers (in-process lifecycle) -->
+  <div class="card mb-3">
+    <div class="card-head">
+      <div class="card-title">Managed inference servers</div>
+      <div class="row-tight">
+        <button class="btn btn-ghost btn-sm" onclick="ifRefresh()">Refresh</button>
+        <button class="btn btn-primary btn-sm" onclick="ifOpenLaunch()">Launch new ↗</button>
+      </div>
+    </div>
+    <div class="text-xs text-muted mb-2">Each managed server runs in its own subprocess on a localhost port and is gated by a per-server bearer token. The token never leaves the dashboard process — your browser talks to the proxy at <code>/api/inference/&lt;id&gt;/predict</code>.</div>
+    <div id="if-list" class="text-xs"></div>
+  </div>
 
   <div class="card mb-3">
     <div class="row">
       <div style="flex:1;min-width:260px">
-        <label class="label">Inference server URL</label>
+        <label class="label">Connect to a server (URL or managed-server id)</label>
         <input class="input input-mono" id="pg-url" type="text" value="http://localhost:8080" onkeydown="if(event.key==='Enter')pgConnect()" />
+      </div>
+      <div style="flex:1;min-width:260px">
+        <label class="label">
+          Bearer token <span class="text-faint">— optional, only if the server requires auth</span>
+        </label>
+        <div style="display:flex;gap:6px">
+          <input class="input input-mono" id="pg-token" type="password" placeholder="paste the token printed by `neural serve`" autocomplete="off" spellcheck="false" style="flex:1" />
+          <button class="btn btn-ghost btn-xs" type="button" onclick="pgToggleToken()" title="Show/hide token">👁</button>
+          <button class="btn btn-ghost btn-xs" type="button" onclick="pgClearToken()" title="Clear">✕</button>
+        </div>
+        <div class="text-xs text-faint mt-1">Stored only in this browser tab's memory — cleared on refresh. Sent via Authorization header through the dashboard proxy.</div>
       </div>
       <div style="padding-top:18px"><button class="btn btn-primary" onclick="pgConnect()">Connect</button></div>
       <div style="padding-top:18px" class="row-tight"><span class="dot" id="pg-dot"></span><span class="text-sm" id="pg-status">Not connected</span></div>
@@ -748,10 +802,105 @@ neural init --model transformer --name text_classifier</div>
           <option value="cnn">CNN / Image</option>
           <option value="rnn">RNN / Sequence</option>
           <option value="transformer">Transformer / Text</option>
+          <option value="audio_cnn">Audio CNN</option>
+          <option value="tcn">TCN / Sequence</option>
+          <option value="tabular">Tabular (named features)</option>
+          <option value="video_cnn">Video CNN</option>
+          <option value="hf_pipeline">HF Pipeline (universal)</option>
         </select>
       </div>
     </div>
   </div>
+
+  <!-- Launch a new managed inference server (drawer-light dialog) -->
+  <div class="scrim" id="if-scrim" onclick="ifCloseLaunch()"></div>
+  <aside class="drawer" id="if-drawer" style="width:min(680px,96vw)">
+    <div class="drawer-head">
+      <div>
+        <div class="drawer-title">Launch inference server</div>
+        <div class="drawer-sub">Pick a source; the dashboard spawns a subprocess on a free port.</div>
+      </div>
+      <button class="btn btn-icon btn-ghost" onclick="ifCloseLaunch()">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="drawer-body" style="padding:14px 18px">
+      <!-- Source-type tabs: local config (existing flow) vs. HuggingFace -->
+      <div class="row-tight mb-3" role="tablist" aria-label="Source type">
+        <button class="btn btn-secondary btn-sm" id="if-tab-config"
+                onclick="ifSwitchSource('config')" type="button">From config</button>
+        <button class="btn btn-ghost btn-sm" id="if-tab-hf"
+                onclick="ifSwitchSource('hf')" type="button">From HuggingFace</button>
+      </div>
+
+      <!-- Source: local config (existing) -->
+      <div id="if-pane-config">
+        <div class="field">
+          <label class="label">Config</label>
+          <select class="select" id="if-cfg-select"></select>
+        </div>
+        <div class="field">
+          <label class="label">Checkpoint (optional — defaults to best)</label>
+          <input class="input input-mono" id="if-ckpt" placeholder="leave blank to use checkpoint_best.pt" />
+        </div>
+      </div>
+
+      <!-- Source: HuggingFace model id (new) -->
+      <div id="if-pane-hf" class="hidden">
+        <div class="field">
+          <label class="label">HuggingFace model id</label>
+          <div style="display:flex;gap:6px">
+            <input class="input input-mono" id="if-hf-id"
+                   placeholder="distilbert-base-uncased-finetuned-sst-2-english"
+                   style="flex:1"
+                   onkeydown="if(event.key==='Enter'){event.preventDefault();ifInspectHF();}" />
+            <button class="btn btn-secondary btn-xs" type="button" onclick="ifInspectHF()" title="Run the model inspector before launching">Inspect</button>
+          </div>
+          <div class="text-xs text-faint mt-1">Owner/repo, e.g. <code>openai/whisper-tiny</code>. URLs from the Hub also work — the trailing path is stripped.</div>
+        </div>
+        <div class="field">
+          <label class="label">Pipeline task</label>
+          <select class="select" id="if-hf-task">
+            <option value="text-classification">text-classification</option>
+            <option value="token-classification">token-classification</option>
+            <option value="zero-shot-classification">zero-shot-classification</option>
+            <option value="fill-mask">fill-mask</option>
+            <option value="text-generation">text-generation</option>
+            <option value="text2text-generation">text2text-generation</option>
+            <option value="summarization">summarization</option>
+            <option value="translation">translation</option>
+            <option value="question-answering">question-answering</option>
+            <option value="image-classification">image-classification</option>
+            <option value="image-segmentation">image-segmentation</option>
+            <option value="object-detection">object-detection</option>
+            <option value="image-to-text">image-to-text</option>
+            <option value="audio-classification">audio-classification</option>
+            <option value="automatic-speech-recognition">automatic-speech-recognition</option>
+            <option value="visual-question-answering">visual-question-answering</option>
+            <option value="feature-extraction">feature-extraction</option>
+          </select>
+        </div>
+        <div id="if-hf-inspect" class="text-xs hidden" style="padding:8px;border:1px solid var(--border);border-radius:8px;margin-bottom:10px"></div>
+        <div class="field">
+          <label class="label">Trust remote code</label>
+          <label class="row-tight" style="cursor:pointer">
+            <input type="checkbox" id="if-hf-trust" />
+            <span class="text-xs text-faint">Required for some custom architectures (e.g. Phi, Qwen variants). Off by default.</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="field">
+        <label class="label">Display name (optional)</label>
+        <input class="input" id="if-name" placeholder="my-imdb-classifier" />
+      </div>
+      <div class="row mt-3">
+        <button class="btn btn-primary" onclick="ifLaunch()">Launch</button>
+        <button class="btn btn-ghost" onclick="ifCloseLaunch()">Cancel</button>
+      </div>
+      <div id="if-launch-error" class="text-xs mt-3 hidden" style="color:var(--danger)"></div>
+    </div>
+  </aside>
 
   <div class="grid grid-2">
     <div>
@@ -797,9 +946,36 @@ neural init --model transformer --name text_classifier</div>
         </div>
 
         <div id="pg-tx-input" class="hidden">
-          <label class="label">Pre-tokenized IDs (comma-separated)</label>
-          <input class="input input-mono" id="pg-tokens" placeholder="101, 2023, 2003, 1037, 102" />
-          <div class="text-xs text-muted mt-2">Most NeuralForge transformer servers expect already-tokenized inputs.</div>
+          <label class="label">Text (server tokenizes), or pre-tokenized IDs</label>
+          <input class="input" id="pg-text" placeholder="the movie was great" />
+          <div class="text-xs text-muted mt-2">Or paste comma-separated token IDs:</div>
+          <input class="input input-mono mt-1" id="pg-tokens" placeholder="101, 2023, 2003, 1037, 102" />
+        </div>
+
+        <div id="pg-audio-input" class="hidden">
+          <label class="label">Audio waveform — comma-separated samples (raw float32)</label>
+          <textarea class="input input-mono" id="pg-audio" placeholder="0.001, 0.002, 0.0, -0.001, …" style="min-height:120px"></textarea>
+          <div class="text-xs text-muted mt-2">Server pads/truncates to (sample_rate × duration_secs). For long clips, write a client that reads the WAV directly.</div>
+        </div>
+
+        <div id="pg-tabular-input" class="hidden">
+          <label class="label">Numeric features (comma-separated)</label>
+          <input class="input input-mono" id="pg-tab-numeric" placeholder="0.1, 0.5, 0.9, 0.2" />
+          <label class="label mt-2">Categorical features (comma-separated indexes)</label>
+          <input class="input input-mono" id="pg-tab-categorical" placeholder="3, 1, 0, 2" />
+        </div>
+
+        <div id="pg-video-input" class="hidden">
+          <label class="label">Video tensor (4D nested list T,C,H,W as JSON)</label>
+          <textarea class="input input-mono" id="pg-video" placeholder="[[[[…]]],…]" style="min-height:80px"></textarea>
+          <div class="text-xs text-muted mt-2">Most users preprocess clips client-side, then paste the resulting 4D float array.</div>
+        </div>
+
+        <div id="pg-hf-input" class="hidden">
+          <label class="label">Universal HF input — pick the field that matches your model's task:</label>
+          <input class="input" id="pg-hf-text" placeholder="text — for text-classification, summarization, etc." />
+          <input class="input input-mono mt-2" id="pg-hf-audio" placeholder="audio waveform — comma-separated floats" />
+          <div class="text-xs text-muted mt-2">For images, use the image drop zone above (or switch to CNN).</div>
         </div>
 
         <div class="row mt-4">
@@ -810,7 +986,7 @@ neural init --model transformer --name text_classifier</div>
           <button class="btn btn-ghost" onclick="pgClearResults()">Clear</button>
           <span class="text-xs text-muted" id="pg-latency"></span>
         </div>
-        <div id="pg-error" class="hidden mt-3 text-xs" style="color:var(--danger)"></div>
+        <div id="pg-error" class="hidden mt-3 text-xs" style="color:var(--danger);white-space:pre-wrap;line-height:1.5;max-height:240px;overflow:auto"></div>
       </div>
     </div>
 
@@ -958,6 +1134,38 @@ neural export -c config.yaml --format torchscript</div>
   <input class="palette-search" id="palette-search" placeholder="Type a command or search…" oninput="renderPalette()" onkeydown="palettenKey(event)" />
   <div class="palette-list" id="palette-list"></div>
 </div>
+
+<!-- Model Browser drawer (HF + local checkpoints + future sources) -->
+<div class="scrim" id="model-scrim" onclick="closeModelBrowser()"></div>
+<aside class="drawer" id="model-drawer" style="width:min(820px, 96vw)">
+  <div class="drawer-head">
+    <div>
+      <div class="drawer-title">Model browser</div>
+      <div class="drawer-sub">Search across registered model sources — pin one into your config</div>
+    </div>
+    <button class="btn btn-icon btn-ghost" onclick="closeModelBrowser()">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+  </div>
+  <div class="drawer-body" id="model-body" style="padding:14px 18px">
+    <div class="row" style="margin-bottom:12px;gap:8px;flex-wrap:wrap">
+      <input class="input input-mono" id="model-q" placeholder="Search models — e.g. 'whisper', 'bert', 'vit'" style="flex:1;min-width:240px" oninput="modelDebouncedSearch()" />
+      <select class="select" id="model-source" style="max-width:160px" onchange="modelRunSearch()"></select>
+      <select class="select" id="model-task" style="max-width:200px" onchange="modelRunSearch()">
+        <option value="">Any task</option>
+      </select>
+      <select class="select" id="model-sort" style="max-width:160px" onchange="modelRunSearch()">
+        <option value="downloads">downloads</option>
+        <option value="likes">likes</option>
+        <option value="trending">trending</option>
+        <option value="updated">recently updated</option>
+      </select>
+      <button class="btn btn-secondary btn-sm" onclick="modelRunSearch()">Search</button>
+    </div>
+    <div class="text-xs text-muted mb-3" id="model-status">Showing top models. Type to refine.</div>
+    <div id="model-results"></div>
+  </div>
+</aside>
 
 <!-- HuggingFace Dataset Browser drawer -->
 <div class="scrim" id="hf-scrim" onclick="closeHFBrowser()"></div>

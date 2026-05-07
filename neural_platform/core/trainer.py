@@ -9,7 +9,7 @@ from __future__ import annotations
 import random
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
 import numpy as np
 import torch
@@ -103,11 +103,46 @@ class Trainer:
         db_path = db_path or str(Path(config.output_dir) / "neuralforge.db")
         self.tracker = ExperimentTracker(db_path)
 
-        # Live event stream — one file per output_dir, overwritten each run
-        events_path = Path(config.output_dir) / "live_events.jsonl"
+        # Live event stream — one file PER RUN, written next to the config.
+        # Previously this was `<output_dir>/live_events.jsonl` shared across
+        # all experiments, which meant a second `neural train` would clobber
+        # the first run's stream. Per-run files let the dashboard track
+        # multiple concurrent runs and stream each independently.
+        events_path = self.run_dir / "live_events.jsonl"
+        events_path.parent.mkdir(parents=True, exist_ok=True)
         self.events = TrainingEventWriter(events_path)
+        self.events_path = events_path
 
-    def fit(self, train_loader, val_loader=None) -> Dict[str, Any]:
+    def fit(
+        self,
+        train_loader,
+        val_loader=None,
+        *,
+        resume_from: Optional[str] = None,
+        resume_mode: Literal["full", "weights_only"] = "full",
+    ) -> Dict[str, Any]:
+        """Run the training loop.
+
+        ``resume_from`` is a path to a NeuralForge checkpoint (.pt) saved by
+        :meth:`PyTorchAdapter.save_checkpoint`. When set, the model's
+        ``state_dict`` is restored before training begins.
+
+        ``resume_mode`` controls how much state is restored:
+
+        * ``"full"``    — restores optimizer state, scheduler state, GradScaler
+                          state if present, last completed epoch, and best
+                          val loss / best epoch counters. Use this to **continue**
+                          a run that was interrupted (or to extend its
+                          ``num_epochs`` for more training).
+        * ``"weights_only"`` — restores only the model weights. Optimizer +
+                          scheduler start fresh, epoch counter resets to 1, best
+                          metrics reset. Use this for **fine-tuning**: a new
+                          loss landscape or a smaller LR makes a new optimizer
+                          state more useful than the saved one.
+
+        The two modes correspond to the ``--resume`` and ``--finetune`` flags
+        on ``neural train`` respectively.
+        """
         cfg = self.config
         train_cfg = cfg.training
         _set_seed(train_cfg.seed)
@@ -139,6 +174,22 @@ class Trainer:
             console.print(f"[dim]Parameters:[/]  {n_params:,}")
         device = self.adapter.get_device()
         console.print(f"[dim]Device:[/]      {device}")
+
+        # ── Resume / fine-tune from a prior checkpoint ───────────────────────
+        # Done after the optimizer/scheduler/scaler are built so we can
+        # restore their states in-place. start_epoch defaults to 1 for fresh
+        # runs; resume("full") sets it to (last_completed + 1). Best metrics
+        # carry over so we don't overwrite a better checkpoint with a worse
+        # one written in the first resumed epoch.
+        start_epoch = 1
+        resumed_best_val_loss = float("inf")
+        resumed_best_epoch = 0
+        if resume_from:
+            start_epoch, resumed_best_val_loss, resumed_best_epoch = (
+                self._apply_resume(model, optimizer, scheduler, scaler,
+                                   resume_from, resume_mode)
+            )
+
         console.print()
 
         total_batches = len(train_loader)
@@ -151,6 +202,9 @@ class Trainer:
             total_epochs=train_cfg.num_epochs,
             total_batches=total_batches,
             device=str(device),
+            resume_from=str(Path(resume_from).resolve()) if resume_from else None,
+            resume_mode=resume_mode if resume_from else None,
+            resume_start_epoch=start_epoch if resume_from else None,
         )
 
         # SQLite experiment tracking
@@ -173,11 +227,41 @@ class Trainer:
         )
 
         history: Dict[str, list] = {"train_loss": [], "val_loss": [], "epochs": []}
-        best_val_loss = float("inf")
-        best_epoch = 0
+        best_val_loss = resumed_best_val_loss
+        best_epoch = resumed_best_epoch
         best_ckpt_path: Optional[str] = None
         start_time = time.time()
         status = "completed"
+
+        # Guard: if the user resumed from a checkpoint at epoch N but the
+        # config's num_epochs is <= N, there's nothing to do. Return early
+        # with the already-completed state so we don't write a synthetic
+        # "training_end" with zero epochs and confuse the dashboard.
+        if start_epoch > train_cfg.num_epochs:
+            console.print(
+                f"[yellow]Nothing to do:[/] resumed at epoch {start_epoch} but "
+                f"training.num_epochs is only {train_cfg.num_epochs}. Bump "
+                f"`training.num_epochs` to extend the run."
+            )
+            self.events.training_end(
+                experiment=cfg.name,
+                status="completed",
+                best_epoch=best_epoch,
+                best_val_loss=best_val_loss if best_val_loss < float("inf") else None,
+                total_epochs=0,
+                duration=0.0,
+            )
+            return {
+                "history": history,
+                "best_val_loss": best_val_loss,
+                "best_epoch": best_epoch,
+                "best_checkpoint": resume_from,
+                "experiment_id": None,
+                "run_id": None,
+                "resumed": True,
+                "resume_mode": resume_mode,
+                "no_op": True,
+            }
 
         try:
             with Progress(
@@ -190,8 +274,10 @@ class Trainer:
                 console=console,
             ) as progress:
                 epoch_task = progress.add_task("[cyan]Training", total=train_cfg.num_epochs)
+                if start_epoch > 1:
+                    progress.advance(epoch_task, advance=start_epoch - 1)
 
-                for epoch in range(1, train_cfg.num_epochs + 1):
+                for epoch in range(start_epoch, train_cfg.num_epochs + 1):
                     # ── Training phase ──────────────────────────────────
                     model.train()
                     train_acc = MetricAccumulator()
@@ -286,7 +372,28 @@ class Trainer:
                             "epoch": epoch,
                             "val_loss": val_loss,
                             "train_metrics": train_metrics,
+                            # Track best-so-far inside the checkpoint so a
+                            # later `--resume` doesn't overwrite a real best
+                            # checkpoint with the first resumed epoch's loss.
+                            "best_val_loss": (best_val_loss
+                                              if best_val_loss < float("inf") else None),
+                            "best_epoch": best_epoch,
                         }
+                        # Capture optimizer hyperparams + scheduler/scaler
+                        # state alongside the model weights so a future
+                        # `--resume` can pick up exactly where we left off.
+                        # Optimizer state lives on its own key inside the
+                        # adapter's payload; everything else rides in extra.
+                        if scheduler is not None and hasattr(scheduler, "state_dict"):
+                            try:
+                                extra["scheduler_state"] = scheduler.state_dict()
+                            except Exception:
+                                pass
+                        if scaler is not None and hasattr(scaler, "state_dict"):
+                            try:
+                                extra["scaler_state"] = scaler.state_dict()
+                            except Exception:
+                                pass
                         # Persist class names if discovered upstream
                         class_names = getattr(self.config, "_class_names", None)
                         if class_names:
@@ -344,6 +451,123 @@ class Trainer:
             "experiment_id": exp_id,
             "run_id": run_id,
         }
+
+    def _apply_resume(
+        self,
+        model,
+        optimizer,
+        scheduler,
+        scaler,
+        resume_from: str,
+        resume_mode: str,
+    ):
+        """Restore training state from a NeuralForge checkpoint, in-place.
+
+        Returns ``(start_epoch, best_val_loss, best_epoch)`` so the caller's
+        loop can pick up at the right epoch and avoid clobbering a real
+        best checkpoint on the first resumed epoch's metrics.
+
+        Behavior:
+
+        * **weights_only** — restore ``state_dict`` only. Optimizer / scheduler
+          / scaler / epoch counter / best metrics all start fresh. Use for
+          fine-tuning, where the loss landscape changes and a stale Adam
+          moment estimate would be more harmful than useful.
+        * **full** — also restore optimizer, scheduler, scaler, epoch counter,
+          and best metrics. Use to **continue** an interrupted run.
+
+        Both modes do a shape-tolerant load: weights with mismatched shapes
+        are skipped with a warning instead of failing the whole resume.
+        """
+        path = Path(resume_from)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Resume checkpoint not found: {resume_from}. "
+                "Pass --resume / --finetune with a path to an existing .pt file."
+            )
+
+        try:
+            payload = torch.load(str(path), map_location=self.adapter.get_device(),
+                                 weights_only=False)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load checkpoint {resume_from}: {exc}"
+            )
+
+        if not isinstance(payload, dict) or "state_dict" not in payload:
+            raise RuntimeError(
+                f"Checkpoint {resume_from} is not a NeuralForge checkpoint "
+                "(missing 'state_dict' key). Was this produced by `neural train`?"
+            )
+
+        # ----- model weights (always) -----
+        sd = payload["state_dict"]
+        try:
+            missing, unexpected = model.load_state_dict(sd, strict=False)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not apply state_dict from {resume_from}: {exc}. "
+                "The checkpoint's model architecture probably doesn't match "
+                "the current config — confirm `model.type` and arch params line up."
+            )
+        if missing:
+            console.print(f"[yellow]⚠[/] {len(missing)} param(s) not in checkpoint, "
+                          f"randomly initialized: e.g. {missing[:3]}")
+        if unexpected:
+            console.print(f"[yellow]⚠[/] {len(unexpected)} extra param(s) in "
+                          f"checkpoint, ignored: e.g. {unexpected[:3]}")
+
+        if resume_mode == "weights_only":
+            console.print(
+                f"[green]✓[/] Fine-tune mode: loaded weights from "
+                f"[bold]{path.name}[/]; optimizer/scheduler start fresh."
+            )
+            return 1, float("inf"), 0
+
+        if resume_mode != "full":
+            raise ValueError(
+                f"Unknown resume_mode {resume_mode!r}; expected 'full' or 'weights_only'."
+            )
+
+        # ----- full state restore -----
+        try:
+            if "optimizer_state" in payload and optimizer is not None:
+                optimizer.load_state_dict(payload["optimizer_state"])
+        except Exception as exc:
+            console.print(f"[yellow]⚠ Could not restore optimizer state:[/] {exc}. "
+                          "Continuing with a fresh optimizer.")
+
+        try:
+            if "scheduler_state" in payload and scheduler is not None and hasattr(scheduler, "load_state_dict"):
+                scheduler.load_state_dict(payload["scheduler_state"])
+        except Exception as exc:
+            console.print(f"[yellow]⚠ Could not restore scheduler state:[/] {exc}.")
+
+        try:
+            if "scaler_state" in payload and scaler is not None and hasattr(scaler, "load_state_dict"):
+                scaler.load_state_dict(payload["scaler_state"])
+        except Exception:
+            pass
+
+        last_epoch = int(payload.get("epoch", 0) or 0)
+        best_val_loss = payload.get("best_val_loss")
+        best_epoch = int(payload.get("best_epoch", last_epoch) or 0)
+        if best_val_loss is None:
+            # Older checkpoints didn't track best separately — fall back to
+            # this epoch's val loss so we don't downgrade good checkpoints.
+            bvl = payload.get("val_loss")
+            best_val_loss = float(bvl) if bvl is not None else float("inf")
+
+        start_epoch = last_epoch + 1
+        console.print(
+            f"[green]✓[/] Resume mode: continuing from epoch {start_epoch} "
+            f"(best so far: val_loss={best_val_loss:.6f} @ epoch {best_epoch}, "
+            f"checkpoint={path.name})."
+            if best_val_loss < float("inf") else
+            f"[green]✓[/] Resume mode: continuing from epoch {start_epoch} "
+            f"(checkpoint={path.name})."
+        )
+        return start_epoch, float(best_val_loss), best_epoch
 
     def _sanity_check_first_batch(self, train_loader) -> None:
         """

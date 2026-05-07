@@ -53,7 +53,10 @@ class TrainingEventWriter:
             f.write(line)
 
     def training_start(self, experiment: str, model_type: str, framework: str,
-                       total_epochs: int, total_batches: int, device: str):
+                       total_epochs: int, total_batches: int, device: str,
+                       resume_from: Optional[str] = None,
+                       resume_mode: Optional[str] = None,
+                       resume_start_epoch: Optional[int] = None):
         self._write(_event("training_start",
             experiment=experiment,
             model_type=model_type,
@@ -61,6 +64,9 @@ class TrainingEventWriter:
             total_epochs=total_epochs,
             total_batches=total_batches,
             device=device,
+            resume_from=resume_from,
+            resume_mode=resume_mode,
+            resume_start_epoch=resume_start_epoch,
         ))
 
     def batch(self, experiment: str, epoch: int, total_epochs: int,

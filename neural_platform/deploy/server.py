@@ -168,14 +168,55 @@ class WeightsResponse(PydanticModel):
 # App factory
 # ---------------------------------------------------------------------------
 
-def create_inference_app(config: ExperimentConfig, checkpoint_path: str) -> FastAPI:
+def create_inference_app(config: ExperimentConfig,
+                         checkpoint_path: Optional[str] = None) -> FastAPI:
     """
     Build a FastAPI inference server for a trained NeuralForge model.
 
     The server loads the model on startup, exposes /predict, and surfaces
-    rich metadata via /info, /info/layers, and /info/weights. CORS is
-    permissive so a browser dashboard on a different port can hit it.
+    rich metadata via /info, /info/layers, and /info/weights.
+
+    ``checkpoint_path`` may be ``None`` for **HuggingFace pipeline** servers —
+    the model wrapper calls ``from_pretrained()`` at build time, so the
+    weights come from the Hub (or HF cache) rather than from a NeuralForge
+    checkpoint. This is the path the dashboard's "Launch from HF" button
+    uses for zero-shot inference. Any other model type with no checkpoint
+    fails the startup hook with a clear error.
+
+    **Authentication.** When the `NEURAL_INFERENCE_TOKEN` env var is set,
+    every endpoint *except* `/health` and `/docs` requires
+    `Authorization: Bearer <token>`. The dashboard manager generates a
+    random token per launched server and holds it server-side; the token
+    never appears in API responses or logs. When the env var is unset
+    (e.g. a manually started `neural serve`) no auth is enforced — same
+    behaviour as before.
+
+    **CORS.** Restricted to localhost origins by default (override via
+    `NEURAL_INFERENCE_CORS_ORIGINS`).
     """
+    import os as _os
+    import secrets as _secrets
+    expected_token = (_os.environ.get("NEURAL_INFERENCE_TOKEN") or "").strip() or None
+    # Default-to-secure: when no token was provided (e.g. `neural serve` was
+    # run manually without piping one in), generate a one-shot token,
+    # log it once, and require it. The opt-out is `NEURAL_INFERENCE_AUTH=off`
+    # — set it explicitly when you really mean "I trust everyone on this
+    # network", e.g. behind a reverse proxy that handles auth.
+    auth_mode = (_os.environ.get("NEURAL_INFERENCE_AUTH") or "on").strip().lower()
+    if not expected_token and auth_mode != "off":
+        expected_token = _secrets.token_urlsafe(32)
+        # Print to stderr ONCE so the operator can grab the token but the
+        # value never goes through the normal logger / structured logs.
+        import sys as _sys
+        print(
+            f"[NeuralForge] No NEURAL_INFERENCE_TOKEN was set — generated a "
+            f"one-shot token for this server.\n"
+            f"  Use:  Authorization: Bearer {expected_token}\n"
+            f"  Or set NEURAL_INFERENCE_AUTH=off to disable auth (NOT "
+            f"recommended on shared networks).",
+            file=_sys.stderr, flush=True,
+        )
+
     app = FastAPI(
         title=f"NeuralForge — {config.model.name}",
         description=(
@@ -184,17 +225,89 @@ def create_inference_app(config: ExperimentConfig, checkpoint_path: str) -> Fast
             "See `/info` for model metadata, `/info/layers` for the architecture "
             "breakdown, and `/predict` to run inference. "
             "Send `Accept: application/json` and a body matching `PredictRequest`."
+            + ("\n\n**Auth required:** include `Authorization: Bearer <token>` "
+               "on every request except `/health`. Set `NEURAL_INFERENCE_AUTH=off` "
+               "or pass `--no-auth` to `neural serve` to disable this." if expected_token else "")
         ),
-        version="0.2.0",
+        version="0.3.1",
         contact={"name": "NeuralForge"},
+        # Themed swagger UI mounted explicitly below.
+        docs_url=None,
+        redoc_url=None,
         openapi_tags=[
             {"name": "System",     "description": "Liveness, model metadata, weight introspection."},
             {"name": "Inference",  "description": "Run predictions on one or more samples."},
         ],
     )
+
+    # ---- Themed Swagger / ReDoc (matches the dashboard's dark theme) ----
+    from fastapi.responses import HTMLResponse as _HTMLResp
+    _DOCS_CSS = """
+      <style>
+        :root { color-scheme: dark; }
+        html, body { background: #0d0e10; color: #e6e8ea; }
+        .swagger-ui, .swagger-ui .topbar { background: #0d0e10 !important; }
+        .swagger-ui .info { background: #131418 !important; }
+        .swagger-ui h1, .swagger-ui h2, .swagger-ui h3, .swagger-ui h4,
+        .swagger-ui .info p, .swagger-ui .info .title { color: #e6e8ea !important; }
+        .swagger-ui .opblock { background: #131418 !important; border-color: #23262d !important; }
+        .swagger-ui .opblock .opblock-summary { background: #1a1d22 !important; }
+        .swagger-ui input, .swagger-ui textarea, .swagger-ui select {
+          background: #0d0e10 !important; color: #e6e8ea !important; border-color: #2c3140 !important; }
+        .swagger-ui .topbar-wrapper img { display: none; }
+        .swagger-ui .topbar-wrapper::before {
+          content: "NeuralForge Inference Server";
+          color: #e6e8ea; font-weight: 600; font-size: 14px; padding: 10px 14px;
+        }
+      </style>
+    """
+    @app.get("/docs", include_in_schema=False)
+    async def _themed_docs() -> _HTMLResp:
+        return _HTMLResp(f"""<!doctype html><html><head>
+<meta charset="utf-8"/><title>NeuralForge Inference</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css"/>
+{_DOCS_CSS}</head><body>
+<div id="swagger-ui"></div>
+<script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+<script>window.ui = SwaggerUIBundle({{url:'/openapi.json', dom_id:'#swagger-ui', deepLinking:true}});</script>
+</body></html>""")
+    cors_env = (_os.environ.get("NEURAL_INFERENCE_CORS_ORIGINS") or "").strip()
+    cors_origins = [o.strip() for o in cors_env.split(",") if o.strip()] or [
+        "http://localhost", "http://127.0.0.1", "http://[::1]",
+        "http://localhost:8000", "http://127.0.0.1:8000",
+        "http://localhost:8765", "http://127.0.0.1:8765",
+    ]
     app.add_middleware(
-        CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_origin_regex=r"^http://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$",
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"],
     )
+
+    if expected_token:
+        # Bearer-token middleware. Constant-time comparison to avoid
+        # leaking via timing differences. The token is read from env and
+        # compared in-process — never logged, never returned.
+        import hmac as _hmac
+        from fastapi import Request as _Request
+        from fastapi.responses import JSONResponse as _JSONResponse
+
+        @app.middleware("http")
+        async def _require_bearer(request: _Request, call_next):
+            path = request.url.path or ""
+            # Health + docs exempted so manager polling and Swagger work.
+            if path in ("/health", "/docs", "/redoc", "/openapi.json"):
+                return await call_next(request)
+            auth = request.headers.get("authorization") or ""
+            if not auth.lower().startswith("bearer "):
+                return _JSONResponse(status_code=401,
+                                     content={"detail": "Bearer token required."})
+            sent = auth.split(None, 1)[1].strip()
+            if not _hmac.compare_digest(sent, expected_token):
+                return _JSONResponse(status_code=401,
+                                     content={"detail": "Bearer token rejected."})
+            return await call_next(request)
 
     from neural_platform.frameworks.factory import get_adapter
     adapter = get_adapter(config)
@@ -204,7 +317,23 @@ def create_inference_app(config: ExperimentConfig, checkpoint_path: str) -> Fast
 
     @app.on_event("startup")
     async def load_model():
-        model, meta = adapter.load_checkpoint(checkpoint_path)
+        if checkpoint_path:
+            model, meta = adapter.load_checkpoint(checkpoint_path)
+        else:
+            # No-checkpoint mode: the only legitimate use is hf_pipeline,
+            # whose model wrapper resolves weights via `from_pretrained` at
+            # __init__ time. For every other model type this means "untrained
+            # random weights" — useless for inference, so we refuse it.
+            mtype = config.model.type.value
+            if mtype != "hf_pipeline":
+                raise RuntimeError(
+                    f"Inference server started with no checkpoint, but model "
+                    f"type is '{mtype}' — only 'hf_pipeline' models can be "
+                    "served without a NeuralForge checkpoint (their weights "
+                    "load from HuggingFace at startup)."
+                )
+            model = adapter.build_model()
+            meta = {}
         model.eval()
         container["model"] = model
         container["device"] = device
@@ -402,23 +531,38 @@ class _InputError(Exception):
 
 def _try_load_tokenizer(config: ExperimentConfig):
     """
-    Best-effort tokenizer load. Used for transformer text→token decoding at
-    request time (so the client can send raw `text`).
+    Best-effort tokenizer load. Used for transformer + hf_pipeline text
+    tasks so the client can send raw `text` instead of pre-tokenizing.
     """
-    if config.model.type.value != "transformer":
+    mtype = config.model.type.value
+    if mtype not in ("transformer", "hf_pipeline"):
         return None
     try:
         from transformers import AutoTokenizer
     except ImportError:
         return None
+    # Choose the tokenizer name from the model config first, then fall back
+    # to the data transforms section, then a generic default.
     name = None
-    if config.model.transformer and config.model.transformer.use_pretrained:
+    if mtype == "transformer" and config.model.transformer and config.model.transformer.use_pretrained:
         name = config.model.transformer.use_pretrained
+    if mtype == "hf_pipeline" and config.model.hf_pipeline and config.model.hf_pipeline.pretrained:
+        name = config.model.hf_pipeline.pretrained
     if not name and config.data.transforms and isinstance(config.data.transforms, dict):
         name = config.data.transforms.get("text", {}).get("tokenizer")
     name = name or "bert-base-uncased"
+    # Pass HF token through if we have one — gated tokenizers (e.g. Llama)
+    # need it. Token never leaves this process; we read via hf_auth.
+    kwargs = {}
     try:
-        return AutoTokenizer.from_pretrained(name)
+        from neural_platform.core.hf_auth import get_token as _hf_token
+        t = _hf_token()
+        if t:
+            kwargs["token"] = t
+    except Exception:
+        pass
+    try:
+        return AutoTokenizer.from_pretrained(name, **kwargs)
     except Exception:
         return None
 
@@ -626,7 +770,102 @@ def _build_input(request: PredictRequest, model_type: str, device, config: Exper
             t = t.permute(0, 2, 1, 3, 4)
         return t.to(device)
 
+    if model_type == "hf_pipeline":
+        # The universal HF wrapper handles every modality; route the request
+        # to whichever input shape matches the resolved pipeline_task.
+        return _build_hf_pipeline_input(request, config, device, tokenizer)
+
     raise _InputError(f"Unknown model type: {model_type}")
+
+
+def _build_hf_pipeline_input(request: PredictRequest, config: ExperimentConfig,
+                              device, tokenizer):
+    """Dispatch on the configured `pipeline_task` to pick the right adapter.
+
+    Text → tokenize via the loaded tokenizer (or use raw `tokens`).
+    Image → decode `image_b64` and resize to whatever the model expects.
+    Audio → accept `inputs` (waveform samples) — same shape as audio_cnn.
+    Tabular / numeric → flat `inputs` vector.
+    Anything we don't have a preprocessor for falls back to raw `inputs`.
+    """
+    task = (config.training.pipeline_task or "").lower().strip()
+    text_tasks = {
+        "text-classification", "token-classification", "question-answering",
+        "summarization", "translation", "text-generation", "fill-mask",
+        "feature-extraction", "sentence-similarity", "zero-shot-classification",
+    }
+    image_tasks = {
+        "image-classification", "image-segmentation", "object-detection",
+        "depth-estimation", "image-to-image", "image-to-text",
+        "zero-shot-image-classification", "keypoint-detection",
+    }
+    audio_tasks = {
+        "audio-classification", "automatic-speech-recognition",
+        "voice-activity-detection", "audio-to-audio",
+    }
+
+    if task in text_tasks:
+        if request.text is not None:
+            if tokenizer is None:
+                raise _InputError(
+                    "No tokenizer is loaded on this server. Pre-tokenize on the "
+                    "client and send 'tokens' instead, or restart the server with "
+                    "a model whose tokenizer is on the Hub."
+                )
+            enc = tokenizer(
+                request.text,
+                max_length=128,
+                padding="max_length", truncation=True, return_tensors="pt",
+            )
+            return {k: v.to(device) for k, v in enc.items()}
+        if request.tokens is not None:
+            tokens = request.tokens
+            if not isinstance(tokens[0], (list, tuple)):
+                tokens = [tokens]
+            return {"input_ids": torch.tensor(tokens, dtype=torch.long).to(device)}
+        raise _InputError(
+            f"Task '{task}' needs 'text' (server-tokenized) or 'tokens' (pre-tokenized)."
+        )
+
+    if task in image_tasks:
+        if request.image_b64 is None:
+            raise _InputError(
+                f"Task '{task}' needs 'image_b64' — base64-encoded PNG/JPG bytes."
+            )
+        import base64, io
+        try:
+            from PIL import Image
+            import torchvision.transforms as T
+        except ImportError as exc:
+            raise _InputError(f"Image inference needs Pillow + torchvision: {exc}")
+        img = Image.open(io.BytesIO(base64.b64decode(request.image_b64))).convert("RGB")
+        # Generic 224×224 resize — most HF image models accept this.
+        transform = T.Compose([T.Resize((224, 224)), T.ToTensor()])
+        return transform(img).unsqueeze(0).to(device)
+
+    if task in audio_tasks:
+        if request.inputs is None:
+            raise _InputError(
+                f"Task '{task}' needs 'inputs' as a list of waveform samples "
+                "(default sample rate 16000)."
+            )
+        data = request.inputs
+        if isinstance(data, list) and data and isinstance(data[0], (int, float)):
+            wav = torch.tensor([data], dtype=torch.float32)
+        else:
+            wav = torch.tensor(data, dtype=torch.float32)
+        return wav.to(device)
+
+    # Fallback: pass `inputs` straight through as a flat float tensor.
+    if request.inputs is None:
+        raise _InputError(
+            f"Task '{task or 'custom'}' needs 'inputs' (list of floats) or one of "
+            "'text' / 'tokens' / 'image_b64' depending on the model's modality."
+        )
+    data = request.inputs
+    if isinstance(data, list) and data and isinstance(data[0], (int, float)):
+        return torch.tensor([data], dtype=torch.float32).to(device)
+    return torch.tensor(data, dtype=torch.float32).to(device)
 
 
 def _build_predictions(
