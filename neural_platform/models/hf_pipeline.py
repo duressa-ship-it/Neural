@@ -37,53 +37,26 @@ from neural_platform.core.registry import registry, MODEL
 from neural_platform.models.base import BaseModel
 
 
-# Map our task strings → the right transformers.Auto* class name.
-# Kept as a string-table so we don't import transformers at module load.
-_TASK_TO_AUTO_CLASS: Dict[str, str] = {
-    # Text
-    "text-classification":         "AutoModelForSequenceClassification",
-    "token-classification":        "AutoModelForTokenClassification",
-    "question-answering":          "AutoModelForQuestionAnswering",
-    "summarization":               "AutoModelForSeq2SeqLM",
-    "translation":                 "AutoModelForSeq2SeqLM",
-    "text-generation":             "AutoModelForCausalLM",
-    "fill-mask":                   "AutoModelForMaskedLM",
-    "feature-extraction":          "AutoModel",
-    "sentence-similarity":         "AutoModel",
-
-    # Vision
-    "image-classification":        "AutoModelForImageClassification",
-    "image-segmentation":          "AutoModelForSemanticSegmentation",
-    "object-detection":            "AutoModelForObjectDetection",
-    "depth-estimation":            "AutoModelForDepthEstimation",
-    "zero-shot-image-classification": "AutoModelForZeroShotImageClassification",
-
-    # Video
-    "video-classification":        "AutoModelForVideoClassification",
-
-    # Audio
-    "audio-classification":        "AutoModelForAudioClassification",
-    "automatic-speech-recognition": "AutoModelForSpeechSeq2Seq",
-    "voice-activity-detection":    "AutoModelForAudioClassification",
-
-    # Multi-modal (where HF has a dedicated Auto class — others fall through to AutoModel)
-    "visual-question-answering":   "AutoModelForVisualQuestionAnswering",
-    "document-question-answering": "AutoModelForDocumentQuestionAnswering",
-    "image-to-text":               "AutoModelForVision2Seq",
-    "image-text-to-text":          "AutoModelForImageTextToText",
-}
-
-
 def _resolve_auto_class_name(task: Optional[str]) -> str:
     """Pick a `transformers.Auto*` class name for the given task.
 
-    Falls back to ``AutoModel`` (the encoder-only base) when the task is
-    None or unrecognized — that's still useful for feature extraction and
-    most encoder-only fine-tuning workflows.
+    Reads from :mod:`core.pipeline_specs` — the single source of truth for
+    every HF pipeline_tag NeuralForge supports. Falls back to ``AutoModel``
+    (the encoder-only base) when the task is None or unrecognized; that's
+    still useful for feature extraction and encoder-only fine-tunes.
     """
-    if task and task in _TASK_TO_AUTO_CLASS:
-        return _TASK_TO_AUTO_CLASS[task]
-    return "AutoModel"
+    from neural_platform.core.pipeline_specs import resolve
+    return resolve(task).auto_class
+
+
+# Backward-compat: a few external callers / tests reference this name. We
+# build it lazily from the spec table so it stays in sync.
+def _build_legacy_auto_class_map() -> Dict[str, str]:
+    from neural_platform.core.pipeline_specs import PIPELINE_SPECS
+    return {task: spec.auto_class for task, spec in PIPELINE_SPECS.items()}
+
+
+_TASK_TO_AUTO_CLASS = _build_legacy_auto_class_map()
 
 
 @registry.register(MODEL, "hf_pipeline")

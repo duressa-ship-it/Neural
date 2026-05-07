@@ -521,33 +521,45 @@ class InferenceServerManager:
 # HF-launch config synthesis
 # ---------------------------------------------------------------------------
 
-# Map fine-grained HF pipeline tasks to NeuralForge's coarse `Task` enum so
-# the synthesized ExperimentConfig passes validation. Anything not in the
-# map falls back to CLASSIFICATION, which is the inference-server default.
-_HF_TASK_TO_COARSE = {
-    "text-classification":             "classification",
-    "sentiment-analysis":              "classification",
-    "image-classification":            "image_classification",
-    "audio-classification":            "classification",
-    "video-classification":            "classification",
-    "token-classification":            "classification",
-    "zero-shot-classification":        "classification",
-    "automatic-speech-recognition":    "classification",
-    "summarization":                   "classification",
-    "translation":                     "classification",
-    "text-generation":                 "classification",
-    "text2text-generation":            "classification",
-    "fill-mask":                       "classification",
-    "feature-extraction":              "classification",
-    "question-answering":              "classification",
-    "table-question-answering":        "classification",
-    "visual-question-answering":       "classification",
-    "image-to-text":                   "classification",
-    "image-segmentation":              "classification",
-    "object-detection":                "classification",
-    "depth-estimation":                "regression",
-    "regression":                      "regression",
+# Map a NeuralForge core.tasks.Task to the closest match in
+# core.config.Task. The two enums overlap but aren't 1:1 — config.Task is a
+# narrower set tied to the trainer's loss + metrics dispatch.
+_COARSE_TASK_FALLBACKS: Dict[str, str] = {
+    # Text generation / seq2seq don't have a first-class slot in config.Task,
+    # so we map them to CLASSIFICATION and let the loss default ride. The
+    # trainer never runs for these synthesized configs anyway — this only
+    # exists to satisfy the validator's schema check.
+    "summarization":            "classification",
+    "translation":              "classification",
+    "text-generation":          "classification",
+    "fill-mask":                "classification",
+    "feature-extraction":       "classification",
+    "automatic-speech-recognition": "classification",
+    "image-to-text":            "classification",
+    "image-text-to-text":       "classification",
+    "visual-question-answering":"classification",
+    "document-question-answering": "classification",
+    "question-answering":       "classification",
+    "depth-estimation":         "regression",
+    # Direct passthroughs — both enums have these strings.
+    "text-classification":      "text_classification",
+    "token-classification":     "classification",
+    "image-classification":     "image_classification",
+    "audio-classification":     "classification",
+    "video-classification":     "classification",
+    "zero-shot-classification": "classification",
+    "image-segmentation":       "classification",
+    "object-detection":         "classification",
+    "voice-activity-detection": "classification",
 }
+
+
+def _coarse_task_for_config(spec) -> str:
+    """Pick a value for ``training.task`` (an instance of
+    ``core.config.Task``) from a pipeline spec. Different enum than the
+    fine-grained ``core.tasks.Task`` — see the fallback table above.
+    """
+    return _COARSE_TASK_FALLBACKS.get(spec.task, "classification")
 
 
 def _synthesize_hf_config(
@@ -572,7 +584,13 @@ def _synthesize_hf_config(
       * model.type        = hf_pipeline
       * model.hf_pipeline.pretrained = the user's HF id
       * training.pipeline_task        = the user's task (used by the input adapter)
+      * training.task / training.loss = derived from the pipeline spec so the
+        validator picks the right code path (e.g. depth-estimation → MSE,
+        not cross-entropy)
       * data.source       = synthetic (won't be used; required by schema)
+
+    All of the above defaults come from
+    :mod:`core.pipeline_specs` so server-side and config-side stay in sync.
 
     We **don't** call the HF Hub here. Inspector checks happen in the UI
     before launch; doing them again would double the latency on every
@@ -580,11 +598,23 @@ def _synthesize_hf_config(
     """
     from neural_platform.core.config import (
         ExperimentConfig, ModelConfig, ModelType, Framework,
-        HFPipelineConfig, TrainingConfig, DataConfig, DeployConfig, Task,
+        HFPipelineConfig, TrainingConfig, DataConfig, DeployConfig,
+        LossFunction, Task,
     )
+    from neural_platform.core.pipeline_specs import resolve
     import yaml as _yaml
 
-    coarse = _HF_TASK_TO_COARSE.get(pipeline_task, "classification")
+    spec = resolve(pipeline_task)
+    coarse = _coarse_task_for_config(spec)
+
+    # Loss derived from the spec. Fall back to cross_entropy for anything
+    # not explicitly mapped — the synthesized config is for serving, not
+    # training, so the loss is never actually exercised.
+    loss_value = (spec.default_loss or "cross_entropy").lower()
+    try:
+        loss = LossFunction(loss_value)
+    except ValueError:
+        loss = LossFunction.CROSS_ENTROPY
 
     # Slugify the model id for the run dir name. We keep the random suffix
     # so re-launches of the same model don't collide and we can tell which
@@ -612,6 +642,7 @@ def _synthesize_hf_config(
         training=TrainingConfig(
             task=Task(coarse),
             pipeline_task=pipeline_task,
+            loss=loss,
             num_epochs=1,    # never trained; satisfy schema
         ),
         data=DataConfig(),   # synthetic defaults — never used

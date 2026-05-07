@@ -131,9 +131,16 @@ class InfoResponse(PydanticModel):
     model_name: str
     model_type: str
     framework: str
-    parameter_count: Optional[int]
-    trainable_parameters: Optional[int]
-    checkpoint_path: str
+    parameter_count: Optional[int] = None
+    trainable_parameters: Optional[int] = None
+    checkpoint_path: Optional[str] = Field(
+        None,
+        description=(
+            "Absolute path to the .pt checkpoint backing this server. "
+            "None when the server was launched in `--no-checkpoint` mode "
+            "(hf_pipeline serving HF weights directly)."
+        ),
+    )
     device: str
     class_names: Optional[List[str]] = Field(
         None, description="Human-readable class labels indexed by class id"
@@ -141,6 +148,13 @@ class InfoResponse(PydanticModel):
     output_size: Optional[int] = None
     epoch: Optional[int] = Field(None, description="Epoch the loaded checkpoint was saved at")
     val_loss: Optional[float] = Field(None, description="Best validation loss at checkpoint time")
+    # Populated when the server is hosting an HF-pipeline model: the HF id,
+    # pipeline_task, and the spec-derived auto/processor classes the server
+    # actually loaded. Lets the UI distinguish "trained run" vs "zero-shot HF".
+    pipeline_task:    Optional[str] = None
+    hf_model_id:      Optional[str] = None
+    auto_class:       Optional[str] = None
+    processor_class:  Optional[str] = None
 
 
 class LayersResponse(PydanticModel):
@@ -340,8 +354,15 @@ def create_inference_app(config: ExperimentConfig,
         container["meta"] = meta
         container["config"] = config
         container["checkpoint"] = checkpoint_path
-        # Try to find a tokenizer for transformer text inputs
-        container["tokenizer"] = _try_load_tokenizer(config)
+        # Spec-aware preprocessor: tokenizer / feature extractor / image
+        # processor / unified processor depending on the configured pipeline_task.
+        # Returned object has the same .from_pretrained-style interface
+        # consumers care about; the input adapter handles the type dispatch.
+        processor = _try_load_processor(config)
+        container["processor"] = processor
+        # Keep the legacy "tokenizer" key around so any third-party code
+        # poking at the container still finds it.
+        container["tokenizer"] = processor
 
     # ------------------------------------------------------------------
     # System
@@ -362,15 +383,60 @@ def create_inference_app(config: ExperimentConfig,
         """Model name, type, parameter counts, checkpoint epoch, class labels."""
         model = container.get("model")
         meta = container.get("meta", {}) or {}
-        n_params = model.count_parameters(trainable_only=False) if hasattr(model, "count_parameters") else None
-        n_trainable = model.count_parameters(trainable_only=True) if hasattr(model, "count_parameters") else None
+        n_params = (model.count_parameters(trainable_only=False)
+                     if hasattr(model, "count_parameters") else None)
+        n_trainable = (model.count_parameters(trainable_only=True)
+                        if hasattr(model, "count_parameters") else None)
 
-        # Output size depends on the model family
+        # Output size depends on the model family. For HF pipelines we also
+        # try to read num_labels off the loaded model's config — the user
+        # didn't have to set it in the synthesized config when launching,
+        # but classifiers do expose it on the HF side.
         output_size = None
         try:
-            output_size = config.model.get_arch_config().output_size
+            arch = config.model.get_arch_config()
+            output_size = getattr(arch, "output_size", None)
         except Exception:
             pass
+        if output_size is None and config.model.type.value == "hf_pipeline":
+            try:
+                hf_cfg = getattr(getattr(model, "encoder", None), "config", None)
+                if hf_cfg is not None:
+                    output_size = getattr(hf_cfg, "num_labels", None)
+            except Exception:
+                pass
+
+        # Spec-derived metadata for HF pipelines so the UI can show what
+        # auto-class / processor the server actually loaded.
+        pipeline_task = config.training.pipeline_task
+        hf_id = (config.model.hf_pipeline.pretrained
+                  if config.model.hf_pipeline else None)
+        auto_class = None
+        processor_class = None
+        if config.model.type.value == "hf_pipeline":
+            try:
+                from neural_platform.core.pipeline_specs import (
+                    resolve as _resolve_spec, PROCESSOR_AUTO_CLASS,
+                )
+                spec = _resolve_spec(pipeline_task)
+                auto_class = spec.auto_class
+                processor_class = PROCESSOR_AUTO_CLASS.get(spec.processor_kind)
+            except Exception:
+                pass
+
+        # If the HF model carries id2label, surface it as class_names so the
+        # Predict UI shows real labels instead of bare ids. Honor any class
+        # names that were stashed on the checkpoint at training time first
+        # (those override — they were chosen by the user).
+        class_names = meta.get("class_names")
+        if class_names is None and config.model.type.value == "hf_pipeline":
+            try:
+                hf_cfg = getattr(getattr(model, "encoder", None), "config", None)
+                id2label = getattr(hf_cfg, "id2label", None) if hf_cfg else None
+                if id2label and len(id2label):
+                    class_names = [id2label[i] for i in sorted(id2label.keys())]
+            except Exception:
+                pass
 
         return InfoResponse(
             model_name=config.model.name,
@@ -380,10 +446,14 @@ def create_inference_app(config: ExperimentConfig,
             trainable_parameters=n_trainable,
             checkpoint_path=checkpoint_path,
             device=str(device),
-            class_names=meta.get("class_names"),
+            class_names=class_names,
             output_size=output_size,
             epoch=meta.get("epoch"),
             val_loss=meta.get("val_loss"),
+            pipeline_task=pipeline_task,
+            hf_model_id=hf_id,
+            auto_class=auto_class,
+            processor_class=processor_class,
         )
 
     @app.get("/info/layers", response_model=LayersResponse, tags=["System"], summary="Per-layer breakdown")
@@ -470,25 +540,96 @@ def create_inference_app(config: ExperimentConfig,
             raise HTTPException(503, "Model not loaded")
         meta = container.get("meta", {}) or {}
         class_names = meta.get("class_names")
+        # Allow id2label from the HF model config to act as class_names if
+        # the user didn't pin any at training time. The Predict UI uses
+        # this to render real labels instead of bare integers.
+        if class_names is None and config.model.type.value == "hf_pipeline":
+            try:
+                hf_cfg = getattr(getattr(model, "encoder", None), "config", None)
+                id2label = getattr(hf_cfg, "id2label", None) if hf_cfg else None
+                if id2label and len(id2label):
+                    class_names = [id2label[i] for i in sorted(id2label.keys())]
+            except Exception:
+                pass
 
         t0 = time.time()
         model_type = config.model.type.value
 
         try:
-            tensor_input = _build_input(request, model_type, device, config, container.get("tokenizer"))
+            tensor_input = _build_input(
+                request, model_type, device, config, container.get("processor"),
+            )
         except _InputError as e:
             raise HTTPException(status_code=422, detail=str(e))
         except Exception as e:
             raise HTTPException(status_code=422, detail=f"Input error: {e}")
 
+        # Resolve the spec ONCE — drives both the generation branch and the
+        # predictions render below. For non-hf_pipeline models, spec is
+        # the default (POSTPROC_LOGITS, no generation).
+        from neural_platform.core.pipeline_specs import (
+            resolve as _resolve_spec, POSTPROC_GENERATED_TEXT,
+        )
+        spec = (_resolve_spec(config.training.pipeline_task)
+                if model_type == "hf_pipeline"
+                else _resolve_spec(None))
+
         with torch.no_grad():
             try:
+                # ---- generative path (.generate + decode) -----------------
+                # Whisper / BART / T5 / GPT-style models. Calling the
+                # forward pass and softmaxing the logits gives token-step
+                # probabilities — useless for the user, who wants the
+                # decoded string. Run .generate() on the underlying HF
+                # encoder and decode via the loaded processor.
+                if spec.needs_generation:
+                    encoder = getattr(model, "encoder", model)
+                    proc = container.get("processor")
+                    if not hasattr(encoder, "generate"):
+                        raise HTTPException(
+                            status_code=500,
+                            detail=f"Task '{spec.task}' needs .generate() but the "
+                                   "loaded model doesn't expose it. Pick a different "
+                                   "auto-class or task.",
+                        )
+                    gen_inputs = (tensor_input if isinstance(tensor_input, dict)
+                                  else {"inputs": tensor_input})
+                    generated = encoder.generate(**gen_inputs)
+                    text = None
+                    if proc is not None:
+                        try:
+                            decoded = proc.batch_decode(
+                                generated, skip_special_tokens=True,
+                            )
+                            text = decoded[0] if decoded else None
+                        except Exception:
+                            text = None
+                    latency_ms = (time.time() - t0) * 1000
+                    # Surface the decoded text as a single Prediction with
+                    # `class_name` carrying the string. The Predict UI
+                    # already knows how to render that field.
+                    label_str = text if text is not None else "(decoder failed)"
+                    pred = Prediction(
+                        label=0,
+                        class_name=label_str,
+                        probability=None,
+                        score=None,
+                    )
+                    return PredictResponse(
+                        predictions=[[pred]],
+                        model_type=model_type,
+                        latency_ms=round(latency_ms, 2),
+                    )
+
+                # ---- non-generative path (existing behavior) -------------
                 if isinstance(tensor_input, dict):
                     logits = model(**tensor_input)
                 elif isinstance(tensor_input, (list, tuple)):
                     logits = model(*tensor_input)
                 else:
                     logits = model(tensor_input)
+            except HTTPException:
+                raise
             except RuntimeError as e:
                 # Most common: shape mismatch. Report as 422 (caller's fault) with
                 # the model's expected dim baked in if we can derive it.
@@ -529,20 +670,28 @@ class _InputError(Exception):
     pass
 
 
-def _try_load_tokenizer(config: ExperimentConfig):
-    """
-    Best-effort tokenizer load. Used for transformer + hf_pipeline text
-    tasks so the client can send raw `text` instead of pre-tokenizing.
+def _try_load_processor(config: ExperimentConfig):
+    """Best-effort preprocessor load.
+
+    Returns the right transformers preprocessor for the configured task —
+    a tokenizer for text models, a feature extractor for raw audio, an
+    image processor for vision models, or a unified processor for
+    multimodal models (Whisper, BLIP, …). Falls back to a tokenizer for
+    backward compatibility with transformer model configs.
+
+    Driven by :mod:`core.pipeline_specs` so the choice stays consistent
+    with the auto-class the model wrapper will load.
     """
     mtype = config.model.type.value
     if mtype not in ("transformer", "hf_pipeline"):
         return None
     try:
-        from transformers import AutoTokenizer
+        import transformers
     except ImportError:
         return None
-    # Choose the tokenizer name from the model config first, then fall back
-    # to the data transforms section, then a generic default.
+
+    # Choose the model id to point the processor at. Mirrors the same
+    # discovery logic the old tokenizer loader used.
     name = None
     if mtype == "transformer" and config.model.transformer and config.model.transformer.use_pretrained:
         name = config.model.transformer.use_pretrained
@@ -551,9 +700,17 @@ def _try_load_tokenizer(config: ExperimentConfig):
     if not name and config.data.transforms and isinstance(config.data.transforms, dict):
         name = config.data.transforms.get("text", {}).get("tokenizer")
     name = name or "bert-base-uncased"
-    # Pass HF token through if we have one — gated tokenizers (e.g. Llama)
+
+    kwargs: Dict[str, Any] = {}
+    # Some processors require trust_remote_code (e.g. custom HF repos).
+    if (mtype == "hf_pipeline" and config.model.hf_pipeline
+            and config.model.hf_pipeline.trust_remote_code):
+        kwargs["trust_remote_code"] = True
+    if (mtype == "hf_pipeline" and config.model.hf_pipeline
+            and config.model.hf_pipeline.revision):
+        kwargs["revision"] = config.model.hf_pipeline.revision
+    # Pass HF token through if we have one — gated processors (e.g. Llama)
     # need it. Token never leaves this process; we read via hf_auth.
-    kwargs = {}
     try:
         from neural_platform.core.hf_auth import get_token as _hf_token
         t = _hf_token()
@@ -561,10 +718,49 @@ def _try_load_tokenizer(config: ExperimentConfig):
             kwargs["token"] = t
     except Exception:
         pass
-    try:
-        return AutoTokenizer.from_pretrained(name, **kwargs)
-    except Exception:
+
+    # Resolve the processor class via the spec table.
+    from neural_platform.core.pipeline_specs import (
+        resolve as _resolve_spec, PROCESSOR_AUTO_CLASS,
+        PROCESSOR_TOKENIZER, PROCESSOR_NONE,
+    )
+    if mtype == "hf_pipeline":
+        spec = _resolve_spec(config.training.pipeline_task)
+        processor_kind = spec.processor_kind
+    else:
+        # Plain `transformer` configs are always tokenizer-shaped.
+        processor_kind = PROCESSOR_TOKENIZER
+
+    if processor_kind == PROCESSOR_NONE:
         return None
+
+    auto_name = PROCESSOR_AUTO_CLASS.get(processor_kind, "AutoTokenizer")
+    auto_cls = getattr(transformers, auto_name, None)
+
+    # If the chosen class doesn't exist (transformers is too old), or the
+    # load fails (model only ships some processor types), fall back through
+    # the chain: AutoProcessor → AutoFeatureExtractor → AutoImageProcessor →
+    # AutoTokenizer. This keeps something useful loaded even when the spec
+    # picked the "ideal" class but the model exposes a narrower one.
+    fallbacks = [auto_name, "AutoProcessor", "AutoFeatureExtractor",
+                 "AutoImageProcessor", "AutoTokenizer"]
+    seen = set()
+    for fb_name in fallbacks:
+        if fb_name in seen:
+            continue
+        seen.add(fb_name)
+        cls = getattr(transformers, fb_name, None)
+        if cls is None:
+            continue
+        try:
+            return cls.from_pretrained(name, **kwargs)
+        except Exception:
+            continue
+    return None
+
+
+# Backward-compat alias — older callers / tests still import _try_load_tokenizer.
+_try_load_tokenizer = _try_load_processor
 
 
 def _shape_hint(config: ExperimentConfig) -> str:
@@ -779,87 +975,187 @@ def _build_input(request: PredictRequest, model_type: str, device, config: Exper
 
 
 def _build_hf_pipeline_input(request: PredictRequest, config: ExperimentConfig,
-                              device, tokenizer):
-    """Dispatch on the configured `pipeline_task` to pick the right adapter.
+                              device, processor):
+    """Dispatch on the configured `pipeline_task`'s spec.
 
-    Text → tokenize via the loaded tokenizer (or use raw `tokens`).
-    Image → decode `image_b64` and resize to whatever the model expects.
-    Audio → accept `inputs` (waveform samples) — same shape as audio_cnn.
-    Tabular / numeric → flat `inputs` vector.
-    Anything we don't have a preprocessor for falls back to raw `inputs`.
+    Reads the spec's ``input_kind`` from :mod:`core.pipeline_specs`. The
+    same table the synthesizer + auto-class lookup use, so an HF launch
+    that sets ``pipeline_task=automatic-speech-recognition`` always lands
+    on the audio path, regardless of how the user typed it.
+
+    Returns whatever shape the underlying HF model's forward / generate
+    expects — usually a dict from a ``processor(...)`` call (covers both
+    tokenizer-style and feature-extractor-style preprocessors).
     """
-    task = (config.training.pipeline_task or "").lower().strip()
-    text_tasks = {
-        "text-classification", "token-classification", "question-answering",
-        "summarization", "translation", "text-generation", "fill-mask",
-        "feature-extraction", "sentence-similarity", "zero-shot-classification",
-    }
-    image_tasks = {
-        "image-classification", "image-segmentation", "object-detection",
-        "depth-estimation", "image-to-image", "image-to-text",
-        "zero-shot-image-classification", "keypoint-detection",
-    }
-    audio_tasks = {
-        "audio-classification", "automatic-speech-recognition",
-        "voice-activity-detection", "audio-to-audio",
-    }
+    from neural_platform.core.pipeline_specs import (
+        resolve as _resolve_spec,
+        INPUT_TEXT, INPUT_TEXT_PAIR, INPUT_TEXT_LABELS,
+        INPUT_IMAGE, INPUT_IMAGE_LABELS, INPUT_IMAGE_TEXT,
+        INPUT_AUDIO, INPUT_AUDIO_TEXT, INPUT_VIDEO, INPUT_TENSOR,
+    )
+    spec = _resolve_spec(config.training.pipeline_task)
+    kind = spec.input_kind
 
-    if task in text_tasks:
-        if request.text is not None:
-            if tokenizer is None:
-                raise _InputError(
-                    "No tokenizer is loaded on this server. Pre-tokenize on the "
-                    "client and send 'tokens' instead, or restart the server with "
-                    "a model whose tokenizer is on the Hub."
-                )
-            enc = tokenizer(
-                request.text,
-                max_length=128,
-                padding="max_length", truncation=True, return_tensors="pt",
-            )
-            return {k: v.to(device) for k, v in enc.items()}
+    # ----- text family ---------------------------------------------------
+    if kind in (INPUT_TEXT, INPUT_TEXT_PAIR, INPUT_TEXT_LABELS):
         if request.tokens is not None:
             tokens = request.tokens
             if not isinstance(tokens[0], (list, tuple)):
                 tokens = [tokens]
             return {"input_ids": torch.tensor(tokens, dtype=torch.long).to(device)}
-        raise _InputError(
-            f"Task '{task}' needs 'text' (server-tokenized) or 'tokens' (pre-tokenized)."
-        )
+        if request.text is None:
+            raise _InputError(
+                f"Task '{spec.task}' needs 'text' (server-tokenized) or 'tokens' (pre-tokenized)."
+            )
+        if processor is None:
+            raise _InputError(
+                "No tokenizer is loaded on this server. Pre-tokenize on the "
+                "client and send 'tokens' instead, or restart with a model "
+                "whose tokenizer is on the Hub."
+            )
+        try:
+            enc = processor(
+                request.text,
+                max_length=128,
+                padding="max_length", truncation=True, return_tensors="pt",
+            )
+        except Exception as exc:
+            raise _InputError(
+                f"The processor for {spec.task} couldn't tokenize the input: {exc}. "
+                "Try sending pre-tokenized `tokens` instead."
+            )
+        return {k: v.to(device) for k, v in enc.items()}
 
-    if task in image_tasks:
+    # ----- image family --------------------------------------------------
+    if kind == INPUT_IMAGE:
         if request.image_b64 is None:
             raise _InputError(
-                f"Task '{task}' needs 'image_b64' — base64-encoded PNG/JPG bytes."
+                f"Task '{spec.task}' needs 'image_b64' — base64-encoded PNG/JPG bytes."
             )
         import base64, io
         try:
             from PIL import Image
+        except ImportError as exc:
+            raise _InputError(f"Image inference needs Pillow: {exc}")
+        img = Image.open(io.BytesIO(base64.b64decode(request.image_b64))).convert("RGB")
+        # Prefer the model's own image processor (handles correct mean/std,
+        # resize, normalization). Fall back to a generic 224×224 only when
+        # no processor loaded — most HF vision models accept that shape.
+        if processor is not None and hasattr(processor, "__call__"):
+            try:
+                enc = processor(images=img, return_tensors="pt")
+                return {k: v.to(device) for k, v in enc.items()}
+            except Exception:
+                pass   # fall through to generic transform
+        try:
             import torchvision.transforms as T
         except ImportError as exc:
-            raise _InputError(f"Image inference needs Pillow + torchvision: {exc}")
-        img = Image.open(io.BytesIO(base64.b64decode(request.image_b64))).convert("RGB")
-        # Generic 224×224 resize — most HF image models accept this.
+            raise _InputError(f"Image inference fallback needs torchvision: {exc}")
         transform = T.Compose([T.Resize((224, 224)), T.ToTensor()])
         return transform(img).unsqueeze(0).to(device)
 
-    if task in audio_tasks:
+    if kind == INPUT_IMAGE_TEXT:
+        if request.image_b64 is None or request.text is None:
+            raise _InputError(
+                f"Task '{spec.task}' needs both 'image_b64' and 'text' "
+                "(the question / instruction)."
+            )
+        if processor is None:
+            raise _InputError(
+                "Multimodal task needs a loaded HF processor (tokenizer + "
+                "image processor combined). Restart with the model on the Hub."
+            )
+        import base64, io
+        from PIL import Image
+        img = Image.open(io.BytesIO(base64.b64decode(request.image_b64))).convert("RGB")
+        try:
+            enc = processor(images=img, text=request.text, return_tensors="pt")
+        except Exception as exc:
+            raise _InputError(f"Multimodal preprocessor rejected the input: {exc}")
+        return {k: v.to(device) for k, v in enc.items()}
+
+    if kind == INPUT_IMAGE_LABELS:
+        # CLIP-style zero-shot — image + candidate text labels.
+        if request.image_b64 is None:
+            raise _InputError("Zero-shot image classification needs 'image_b64'.")
+        if processor is None:
+            raise _InputError("CLIP-style models need a loaded HF processor.")
+        labels = request.text   # accept comma-separated string or list of strings
+        if not labels:
+            raise _InputError(
+                "Zero-shot image classification needs candidate labels in the "
+                "'text' field, comma-separated (e.g. 'a cat, a dog, a banana')."
+            )
+        if isinstance(labels, str):
+            labels = [s.strip() for s in labels.split(",") if s.strip()]
+        import base64, io
+        from PIL import Image
+        img = Image.open(io.BytesIO(base64.b64decode(request.image_b64))).convert("RGB")
+        try:
+            enc = processor(images=img, text=labels, return_tensors="pt", padding=True)
+        except Exception as exc:
+            raise _InputError(f"CLIP processor rejected the input: {exc}")
+        return {k: v.to(device) for k, v in enc.items()}
+
+    # ----- audio family --------------------------------------------------
+    if kind in (INPUT_AUDIO, INPUT_AUDIO_TEXT):
         if request.inputs is None:
             raise _InputError(
-                f"Task '{task}' needs 'inputs' as a list of waveform samples "
+                f"Task '{spec.task}' needs 'inputs' as a list of waveform samples "
                 "(default sample rate 16000)."
             )
         data = request.inputs
+        # Flatten to a 1D float waveform — feature extractors expect that.
         if isinstance(data, list) and data and isinstance(data[0], (int, float)):
-            wav = torch.tensor([data], dtype=torch.float32)
+            wav = [float(x) for x in data]
+        elif isinstance(data, list) and data and isinstance(data[0], (list, tuple)):
+            wav = [float(x) for x in data[0]]   # take first sample if 2D was sent
         else:
-            wav = torch.tensor(data, dtype=torch.float32)
-        return wav.to(device)
+            wav = list(data)
 
-    # Fallback: pass `inputs` straight through as a flat float tensor.
+        # If we have a feature extractor / processor, run it. ASR + audio
+        # classification with HF processors expect mel-spectrograms, not
+        # raw waveform — skipping this is what causes "got MPSFloatType
+        # instead of Long" for Whisper (forward gets a raw waveform tensor
+        # but expects pre-extracted features).
+        if processor is not None and hasattr(processor, "__call__"):
+            try:
+                # Most feature extractors expect kwarg `sampling_rate`.
+                enc = processor(
+                    wav, sampling_rate=16000, return_tensors="pt",
+                )
+                return {k: v.to(device) for k, v in enc.items()}
+            except Exception as exc:
+                # Some processors don't accept `sampling_rate` (older
+                # versions); fall back to the no-kwarg call.
+                try:
+                    enc = processor(wav, return_tensors="pt")
+                    return {k: v.to(device) for k, v in enc.items()}
+                except Exception:
+                    raise _InputError(
+                        f"The audio processor rejected the waveform: {exc}. "
+                        "Verify the model's expected sample rate (most HF "
+                        "audio models want 16 kHz)."
+                    )
+        # No feature extractor available — fall back to raw waveform tensor
+        # (works for older audio_cnn-style models that take raw inputs).
+        return torch.tensor([wav], dtype=torch.float32).to(device)
+
+    # ----- video, fallback ----------------------------------------------
+    if kind == INPUT_VIDEO:
+        if request.inputs is None:
+            raise _InputError(
+                f"Task '{spec.task}' needs 'inputs' as a 4D nested list (T, C, H, W)."
+            )
+        t = torch.tensor(request.inputs, dtype=torch.float32)
+        if t.dim() == 4:
+            t = t.unsqueeze(0)
+        return t.to(device)
+
+    # Generic tensor fallback — last resort.
     if request.inputs is None:
         raise _InputError(
-            f"Task '{task or 'custom'}' needs 'inputs' (list of floats) or one of "
+            f"Task '{spec.task}' needs 'inputs' (list of floats) or one of "
             "'text' / 'tokens' / 'image_b64' depending on the model's modality."
         )
     data = request.inputs
