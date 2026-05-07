@@ -1,37 +1,135 @@
 [project]
 name = "neural-platform"
-version = "0.1.0"
-description = "NeuralForge — a multi-framework platform for building, training, and deploying neural networks"
+version = "0.4.2"
+description = "NeuralForge — multi-framework platform for building, training, and serving neural networks from a config file or a HuggingFace model id"
 readme = "README.md"
 requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Derilius" }]
+keywords = ["neural-networks", "pytorch", "huggingface", "training", "inference", "fastapi"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# ---------------------------------------------------------------------------
+# Runtime dependencies
+# ---------------------------------------------------------------------------
+# Anything required to run `neural train`, `neural serve`, and the dashboard
+# in their default configurations. Modality-specific extras (transformers,
+# datasets, torchaudio, peft, etc.) live in the optional groups below so a
+# user who only wants to train an MLP doesn't have to pull all of HF in.
 dependencies = [
+    # Core ML
     "torch>=2.0.0",
-    "torchvision>=0.15.0",
+    "numpy>=1.24.0",
+    "scikit-learn>=1.3.0",
+
+    # Config / CLI
     "pydantic>=2.0.0",
     "pyyaml>=6.0",
     "click>=8.1.0",
+    "rich>=13.0.0",
+
+    # Web (dashboard + inference server)
     "fastapi>=0.100.0",
     "uvicorn[standard]>=0.23.0",
-    "numpy>=1.24.0",
-    "scikit-learn>=1.3.0",
-    "tqdm>=4.65.0",
-    "rich>=13.0.0",
-    "pillow>=10.0.0",
-    "pandas>=2.0.0",
+    "httpx>=0.25.0",
     "python-multipart>=0.0.6",
     "aiofiles>=23.0.0",
-    "accelerate>=1.10.1",
+
+    # Data utilities (used across the loader paths)
+    "pandas>=2.0.0",
+    "tqdm>=4.65.0",
+    "pillow>=10.0.0",
+
+    # System telemetry (the dashboard's CPU/RAM/GPU strip)
+    "psutil>=5.9.0",
 ]
 
+# ---------------------------------------------------------------------------
+# Optional dependency groups
+# ---------------------------------------------------------------------------
+# Install with `pip install -e .[hf,vision,audio]` etc. The `all` group is a
+# convenience superset.
 [project.optional-dependencies]
+
+# HuggingFace tooling — needed for the Predict tab's "Launch from HF" button,
+# `model.type=hf_pipeline` configs, and the validator's compatibility checks.
+hf = [
+    "transformers>=4.30.0",
+    "datasets>=2.14.0",
+    "accelerate>=0.20.0",
+    "sentencepiece>=0.1.99",
+    "safetensors>=0.4.0",
+    "tokenizers>=0.13.0",
+    "huggingface-hub>=0.16.0",
+]
+
+# Parameter-efficient fine-tuning (LoRA adapters). Detected automatically by
+# the model_source loading-pattern probe; only required when you actually
+# train or serve a peft adapter repo.
+peft = ["peft>=0.7.0"]
+
+# Image-modality extras
+vision = ["torchvision>=0.15.0"]
+
+# Audio-modality extras (waveform decoding for HF datasets, mel-spectrograms,
+# torchcodec for newer datasets that ship Audio cells as torchcodec decoders)
+audio = [
+    "torchaudio>=2.0.0",
+    "soundfile>=0.12.0",
+    "librosa>=0.10.0",
+    "torchcodec>=0.1.0",
+]
+
+# Video-modality extras
+video = ["torchvision>=0.15.0", "av>=10.0.0"]
+
+# Alternative training frameworks (the adapter stubs are present in-tree but
+# the actual frameworks aren't pulled in by default).
 tensorflow = ["tensorflow>=2.13.0"]
 jax = ["jax>=0.4.0", "flax>=0.7.0"]
-nlp = ["transformers>=4.30.0", "datasets>=2.14.0"]
-dev = ["pytest>=7.0.0", "black>=23.0.0"]
 
+# Dev tools — pytest + the small set of helpers our test suite uses.
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+
+# Convenience: install everything except the alt-framework adapters.
+all = [
+    "neural-platform[hf,peft,vision,audio,video,dev]",
+]
+
+# ---------------------------------------------------------------------------
+# Entry points
+# ---------------------------------------------------------------------------
 [project.scripts]
 neural = "neural_platform.cli.commands:cli"
 
+# ---------------------------------------------------------------------------
+# URLs
+# ---------------------------------------------------------------------------
+[project.urls]
+Homepage = "https://github.com/Derilius/neural-platform"
+Repository = "https://github.com/Derilius/neural-platform"
+Issues = "https://github.com/Derilius/neural-platform/issues"
+
+# ---------------------------------------------------------------------------
+# Build system
+# ---------------------------------------------------------------------------
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
@@ -40,4 +138,37 @@ build-backend = "setuptools.build_meta"
 include = ["neural_platform*"]
 
 [tool.setuptools.package-data]
-"neural_platform" = ["web/static/*.html"]
+"neural_platform" = [
+    "web/static/*.html",
+    "web/static/*.css",
+    "web/static/*.js",
+    "cli/_templates/*.yaml",
+]
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers"]
+filterwarnings = [
+    # FastAPI's deprecated on_event hook fires repeatedly during tests and
+    # drowns real warnings. Suppressed in test output only.
+    "ignore::DeprecationWarning:fastapi",
+    "ignore::DeprecationWarning:starlette",
+]
+
+# ---------------------------------------------------------------------------
+# black + ruff (light formatter / linter config)
+# ---------------------------------------------------------------------------
+[tool.black]
+line-length = 100
+target-version = ["py39", "py310", "py311", "py312"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]   # line-length handled by black

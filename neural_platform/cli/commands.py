@@ -18,7 +18,7 @@ console = Console()
 
 
 @click.group()
-@click.version_option(version="0.1.0", prog_name="neural")
+@click.version_option(version="0.4.2", prog_name="neural")
 def cli():
     """
     NeuralForge — Build, train, and deploy neural networks from config.

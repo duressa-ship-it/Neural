@@ -3,7 +3,7 @@ NeuralForge — Multi-framework Neural Network Platform
 Build, train, and deploy neural networks via config, CLI, or web UI.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.4.2"
 __author__ = "NeuralForge"
 
 def __getattr__(name):
