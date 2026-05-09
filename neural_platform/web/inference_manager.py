@@ -396,6 +396,62 @@ class InferenceServerManager:
         except Exception:
             return {"text": r.text}
 
+    async def proxy_stream(self, server_id: str, path: str,
+                            json_body: Optional[dict] = None,
+                            timeout_s: float = 600.0):
+        """Async-generator proxy that forwards an SSE stream from the
+        held server with its bearer token attached.
+
+        Yields raw bytes chunks suitable for re-emission via
+        ``StreamingResponse``. The token never appears in the yielded
+        bytes — it's only added to the outbound request header. If the
+        upstream returns a non-200 the generator yields a single SSE
+        ``error`` event so the browser can render something useful.
+        """
+        with self._lock:
+            managed = self._servers.get(server_id)
+        if not managed:
+            raise KeyError(f"Unknown inference server '{server_id}'.")
+        self._refresh(managed)
+        if managed.info.status != "running":
+            raise RuntimeError(
+                f"Inference server '{server_id}' is {managed.info.status}; "
+                f"can't stream."
+            )
+        try:
+            import httpx
+        except ImportError as exc:
+            raise RuntimeError("httpx is required to proxy streams") from exc
+
+        url = f"http://{self.host}:{managed.info.port}{path}"
+        headers = {
+            "Authorization": f"Bearer {managed.token}",
+            "Accept":        "text/event-stream",
+        }
+
+        async def gen():
+            import json as _json
+            async with httpx.AsyncClient(timeout=timeout_s) as client:
+                try:
+                    async with client.stream(
+                        "POST", url, headers=headers, json=json_body or {},
+                    ) as resp:
+                        if resp.status_code >= 400:
+                            try:
+                                detail = (await resp.aread()).decode("utf-8", "replace")
+                            except Exception:
+                                detail = f"HTTP {resp.status_code}"
+                            payload = _json.dumps({"detail": detail[:300]})
+                            yield f"event: error\ndata: {payload}\n\n".encode()
+                            return
+                        async for chunk in resp.aiter_bytes():
+                            if chunk:
+                                yield chunk
+                except Exception as exc:
+                    payload = _json.dumps({"detail": _redact(str(exc))[:300]})
+                    yield f"event: error\ndata: {payload}\n\n".encode()
+        return gen()
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

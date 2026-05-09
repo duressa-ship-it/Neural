@@ -2445,6 +2445,10 @@ async function pgConnect() {
     // /info now carries a ui_hint dict per the connected model's task —
     // we toggle visibility instead of switching across hardcoded panels.
     pgApplyHint(info.ui_hint || _pgFallbackHintFor(info.model_type));
+    // Chat surface — visible whenever the loaded tokenizer ships a
+    // chat_template. Replaces the universal input panel for these
+    // models since multi-turn is the natural way to use them.
+    pgSetChatMode(!!info.has_chat_template);
     toast('Connected to inference server', 'success');
   } catch (e) {
     pgSetStatus('err', 'Cannot reach server');
@@ -2509,11 +2513,16 @@ function pgApplyHint(hint) {
     const el = document.getElementById(id);
     if (el) el.classList.toggle('hidden', !on);
   };
-  set('pg-text-row',    !!hint.show_text);
-  set('pg-context-row', !!hint.show_context);
-  set('pg-labels-row',  !!hint.show_candidate_labels);
-  set('pg-file-row',    !!hint.show_file);
-  set('pg-gen-row',     !!hint.show_generation_knobs);
+  set('pg-text-row',     !!hint.show_text);
+  set('pg-context-row',  !!hint.show_context);
+  set('pg-labels-row',   !!hint.show_candidate_labels);
+  set('pg-file-row',     !!hint.show_file);
+  set('pg-gen-row',      !!hint.show_generation_knobs);
+  // Streaming toggle: visible only for generative tasks, where the
+  // /predict/stream endpoint is meaningful. The default 'on' state is
+  // intentional — for ASR / chat / summarization, watching tokens
+  // arrive is dramatically better than waiting for the full response.
+  set('pg-stream-toggle', !!hint.show_generation_knobs);
 
   // Update placeholders / labels.
   const text = document.getElementById('pg-text');
@@ -2645,6 +2654,14 @@ let _pgHint     = null;   // last hint object applied (drives pgRun's payload as
 let _pgAudioB64 = null;   // base64 of a dropped audio file
 let _pgVideoB64 = null;   // base64 of a dropped video file
 let _pgFileMime = null;   // MIME hint forwarded with the b64 field
+let _pgStreamCtl = null;  // AbortController for an in-flight streaming request
+
+// Chat-mode state (only used when info.has_chat_template is true).
+// _pgChatMessages is the in-memory transcript; clearing it is "+ New chat".
+// _pgChatPendingImage is set by pgChatAttach and consumed on the next send.
+let _pgChatMessages = [];
+let _pgChatPendingImage = null;
+let _pgChatActive = false;
 
 // Legacy MLP grid helpers — kept as no-ops so any cached HTML calling
 // them doesn't throw. The new universal panel doesn't render the grid.
@@ -2740,6 +2757,21 @@ async function pgRun() {
     // by the path). For external servers, attach the token via the
     // Authorization header (never in the body / URL).
     const managedId = _pgManagedId(url);
+
+    // Streaming branch — generative tasks with the toggle on. SSE pumps
+    // tokens into _pgRenderGeneratedText incrementally and the regular
+    // bar-chart path is skipped. Falls back to the normal /predict on
+    // any pre-flight failure (non-generative task → 400).
+    const wantsStream = (
+      hint.show_generation_knobs
+      && document.getElementById('pg-stream')?.checked
+    );
+    if (wantsStream) {
+      const ok = await pgRunStream({ payload, url, managedId, btn });
+      if (ok) return;   // streamed successfully; finally-block restores button
+      // fall through to the regular path on stream failure
+    }
+
     let res;
     if (managedId) {
       const t0 = performance.now();
@@ -2780,8 +2812,360 @@ async function pgRun() {
     } catch (_) {}
   } finally {
     btn.disabled = false;
-    btn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5,3 19,12 5,21"/></svg> Run prediction`;
+    btn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-with="2.5"><polygon points="5,3 19,12 5,21"/></svg> Run prediction`;
+    // Hide the Stop button + drop the abort controller — only relevant
+    // while a stream was in flight, but cheap to do unconditionally.
+    const stopBtn = document.getElementById('pg-stop');
+    if (stopBtn) stopBtn.classList.add('hidden');
+    _pgStreamCtl = null;
   }
+}
+
+/**
+ * Stream tokens from a generative model via SSE. Returns true on a
+ * clean stream, false if the caller should fall back to /predict.
+ * Handles cancellation via _pgStreamCtl (the Stop button).
+ */
+async function pgRunStream({ payload, url, managedId, btn }) {
+  const stopBtn = document.getElementById('pg-stop');
+  const empty   = document.getElementById('pg-empty');
+  const richTxt = document.getElementById('pg-rich-text');
+  const errEl   = document.getElementById('pg-error');
+
+  // Pre-clear the UI: hide everything else, show the text pane that
+  // will receive incremental updates.
+  ['pg-bars', 'pg-rich-image', 'pg-rich-spans'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) { el.classList.add('hidden'); el.innerHTML = ''; }
+  });
+  empty.classList.add('hidden');
+  richTxt.classList.remove('hidden');
+  richTxt.textContent = '';
+  if (stopBtn) stopBtn.classList.remove('hidden');
+
+  _pgStreamCtl = new AbortController();
+  const t0 = performance.now();
+  let acc = '';   // accumulated decoded text
+  let finalPayload = null;
+
+  // Pick the URL: managed servers route through the dashboard's
+  // streaming proxy (token attached server-side). External servers go
+  // through their own /predict/stream with the bearer header.
+  let endpoint, init;
+  if (managedId) {
+    endpoint = `/api/inference/${encodeURIComponent(managedId)}/predict/stream`;
+    init = {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
+      body:    JSON.stringify({ ...payload, server_url: undefined }),
+      signal:  _pgStreamCtl.signal,
+    };
+  } else {
+    // External-server streaming requires the inference server's
+    // /predict/stream — we don't go through /api/proxy/predict for SSE.
+    // Strip the trailing slash, prepend bearer if present.
+    const headers = { 'Content-Type': 'application/json',
+                       'Accept': 'text/event-stream', ..._pgAuthHeaders() };
+    endpoint = url.replace(/\/+$/, '') + '/predict/stream';
+    init = { method: 'POST', headers, body: JSON.stringify(payload),
+             signal: _pgStreamCtl.signal };
+  }
+
+  let resp;
+  try {
+    resp = await fetch(endpoint, init);
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      richTxt.textContent += '\n\n[stopped]';
+      return true;   // stream was cancelled cleanly; nothing to render via /predict
+    }
+    return false;    // network-level failure → caller falls back to /predict
+  }
+  if (!resp.ok || !resp.body) {
+    return false;    // server rejected (e.g. 400 because task isn't generative)
+  }
+
+  // SSE is a text/event-stream of `event: …\ndata: …\n\n` records.
+  // We don't pull in a library — a small line-buffered parser is enough.
+  const reader  = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  let evType = '', evData = '';
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      // Split off complete events on the blank-line delimiter.
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) >= 0) {
+        const block = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        evType = ''; evData = '';
+        for (const line of block.split('\n')) {
+          if (line.startsWith('event:')) evType = line.slice(6).trim();
+          else if (line.startsWith('data:')) {
+            evData += (evData ? '\n' : '') + line.slice(5).trim();
+          }
+        }
+        if (evType === 'token' && evData) {
+          // tokens come as JSON-encoded strings
+          let piece = '';
+          try { piece = JSON.parse(evData); }
+          catch (_) { piece = evData; }
+          acc += piece;
+          richTxt.textContent = acc;
+        } else if (evType === 'done') {
+          try { finalPayload = JSON.parse(evData); }
+          catch (_) {}
+        } else if (evType === 'error') {
+          let detail = evData;
+          try { detail = JSON.parse(evData).detail || detail; }
+          catch (_) {}
+          errEl.textContent = detail;
+          errEl.classList.remove('hidden');
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name !== 'AbortError') {
+      errEl.textContent = 'Stream interrupted: ' + (e.message || String(e));
+      errEl.classList.remove('hidden');
+    }
+  }
+
+  const wall = performance.now() - t0;
+  document.getElementById('pg-latency').textContent =
+    `⚡ ${finalPayload?.latency_ms != null ? finalPayload.latency_ms.toFixed(1) : '—'} ms server · ${wall.toFixed(0)} ms wall`;
+  pushLatencyPoint(wall);
+  pgLastRes = {
+    predictions: [{ class_name: acc, label: 0, probability: null,
+                     score: null, metadata: null }],
+    result_kind: 'generated_text',
+    latency_ms:  finalPayload?.latency_ms ?? null,
+    wall_latency_ms: wall,
+    raw: finalPayload,
+  };
+  document.getElementById('pg-json-req').textContent = JSON.stringify(payload, null, 2);
+  document.getElementById('pg-json-res').textContent = JSON.stringify(finalPayload || { tokens: acc }, null, 2);
+  return true;
+}
+
+function pgStopStream() {
+  if (_pgStreamCtl) {
+    try { _pgStreamCtl.abort(); }
+    catch (_) {}
+    _pgStreamCtl = null;
+  }
+}
+
+/* ----- Chat mode (multi-turn for any-to-any / chat-template models) ----- */
+
+/**
+ * Toggle chat mode on/off. When on, the chat transcript pane is
+ * shown and the regular universal input is hidden. The Run button
+ * is also hidden — chat sends via the chat composer's enter key.
+ */
+function pgSetChatMode(on) {
+  _pgChatActive = !!on;
+  const chat   = document.getElementById('pg-chat');
+  const univ   = document.getElementById('pg-universal');
+  const runBtn = document.getElementById('pg-run');
+  if (chat)   chat.classList.toggle('hidden', !on);
+  if (univ)   univ.classList.toggle('hidden', !!on);
+  if (runBtn) runBtn.classList.toggle('hidden', !!on);
+  if (on) {
+    pgChatNew();
+  } else {
+    _pgChatMessages = [];
+    _pgChatPendingImage = null;
+  }
+}
+
+/** Reset the chat history (used on connect + by the New Chat button). */
+function pgChatNew() {
+  _pgChatMessages = [];
+  _pgChatPendingImage = null;
+  _pgChatRender();
+  pgClearResults();
+  const att = document.getElementById('pg-chat-attach');
+  if (att) att.textContent = '';
+}
+
+/** Stash a base64 image to attach to the next user message. */
+function pgChatAttach(file) {
+  if (!file) return;
+  const r = new FileReader();
+  r.onload = e => {
+    _pgChatPendingImage = (e.target.result || '').split(',')[1] || null;
+    const att = document.getElementById('pg-chat-attach');
+    if (att) att.textContent = `📎 ${file.name} attached to next message`;
+  };
+  r.readAsDataURL(file);
+}
+
+/** Send the current composer text (+ optional pending image) as a
+ * user turn, then stream the assistant's response into a placeholder
+ * bubble that updates in place. */
+async function pgChatSend() {
+  const ta = document.getElementById('pg-chat-input');
+  const txt = (ta?.value || '').trim();
+  if (!txt && !_pgChatPendingImage) return;
+
+  // Build the user message — single text part, or text + image when an
+  // attachment is pending.
+  const userMsg = { role: 'user' };
+  if (_pgChatPendingImage) {
+    userMsg.content = [
+      { type: 'image', image_b64: _pgChatPendingImage },
+      ...(txt ? [{ type: 'text', text: txt }] : []),
+    ];
+  } else {
+    userMsg.content = txt;
+  }
+  _pgChatMessages.push(userMsg);
+
+  // Clear composer state immediately — the user expects the bubble to
+  // appear and the box to empty.
+  if (ta) ta.value = '';
+  _pgChatPendingImage = null;
+  const att = document.getElementById('pg-chat-attach');
+  if (att) att.textContent = '';
+
+  // Push a placeholder assistant message that the streamer fills in.
+  const assistantMsg = { role: 'assistant', content: '' };
+  _pgChatMessages.push(assistantMsg);
+  _pgChatRender();
+
+  // Stream the response.
+  const url = document.getElementById('pg-url').value.trim();
+  const managedId = _pgManagedId(url);
+  const payload = {
+    server_url: url,
+    messages: _pgChatMessages.slice(0, -1),  // exclude the placeholder
+    return_probabilities: false,
+  };
+  // Forward generation knobs from the universal panel even when hidden;
+  // makes them tunable for chat too.
+  const gMax  = parseInt(document.getElementById('pg-gen-max')?.value);
+  const gTemp = parseFloat(document.getElementById('pg-gen-temp')?.value);
+  const gSamp = document.getElementById('pg-gen-sample')?.checked;
+  if (!isNaN(gMax))  payload.max_new_tokens = gMax;
+  if (!isNaN(gTemp)) payload.temperature = gTemp;
+  if (gSamp != null) payload.do_sample = !!gSamp;
+
+  const stopBtn = document.getElementById('pg-stop');
+  if (stopBtn) stopBtn.classList.remove('hidden');
+  _pgStreamCtl = new AbortController();
+
+  let endpoint, init;
+  if (managedId) {
+    endpoint = `/api/inference/${encodeURIComponent(managedId)}/predict/stream`;
+    init = {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json',
+                  'Accept': 'text/event-stream' },
+      body: JSON.stringify({ ...payload, server_url: undefined }),
+      signal: _pgStreamCtl.signal,
+    };
+  } else {
+    endpoint = url.replace(/\/+$/, '') + '/predict/stream';
+    init = {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json',
+                  'Accept': 'text/event-stream', ..._pgAuthHeaders() },
+      body: JSON.stringify(payload),
+      signal: _pgStreamCtl.signal,
+    };
+  }
+
+  try {
+    const resp = await fetch(endpoint, init);
+    if (!resp.ok || !resp.body) {
+      assistantMsg.content = `(server returned ${resp.status})`;
+      _pgChatRender();
+      return;
+    }
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) >= 0) {
+        const block = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        let evType = '', evData = '';
+        for (const line of block.split('\n')) {
+          if (line.startsWith('event:'))      evType = line.slice(6).trim();
+          else if (line.startsWith('data:')) evData += (evData ? '\n' : '') + line.slice(5).trim();
+        }
+        if (evType === 'token' && evData) {
+          let piece = '';
+          try { piece = JSON.parse(evData); } catch (_) { piece = evData; }
+          assistantMsg.content += piece;
+          _pgChatRender();
+        } else if (evType === 'error') {
+          let detail = evData;
+          try { detail = JSON.parse(evData).detail || detail; } catch (_) {}
+          assistantMsg.content = `(error) ${detail}`;
+          _pgChatRender();
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name !== 'AbortError') {
+      assistantMsg.content += `\n[stream interrupted: ${e.message || e}]`;
+      _pgChatRender();
+    }
+  } finally {
+    if (stopBtn) stopBtn.classList.add('hidden');
+    _pgStreamCtl = null;
+  }
+}
+
+/** Render the chat transcript into #pg-chat-transcript. */
+function _pgChatRender() {
+  const host = document.getElementById('pg-chat-transcript');
+  if (!host) return;
+  const bubble = (m, idx) => {
+    const role = m.role || 'user';
+    const isUser = role === 'user';
+    const isSystem = role === 'system';
+    const align = isUser ? 'flex-end' : 'flex-start';
+    const bg = isUser ? 'var(--accent-soft)'
+              : isSystem ? 'transparent'
+              : 'var(--surface-2)';
+    const border = isSystem ? '1px dashed var(--border)' : '1px solid var(--border)';
+    let body;
+    if (typeof m.content === 'string') {
+      body = escapeHtml(m.content) || '<span class="text-faint">…</span>';
+    } else if (Array.isArray(m.content)) {
+      body = m.content.map(part => {
+        if (part.type === 'text')
+          return escapeHtml(part.text || '');
+        if (part.type === 'image' && part.image_b64)
+          return `<img src="data:image/*;base64,${part.image_b64}" style="max-width:200px;border-radius:6px;display:block;margin:4px 0">`;
+        if (part.type === 'audio')
+          return `<span class="text-xs text-faint">🎵 audio attached</span>`;
+        return '';
+      }).join('');
+    } else {
+      body = '';
+    }
+    return `
+      <div style="align-self:${align};max-width:80%;background:${bg};border:${border};border-radius:10px;padding:8px 12px">
+        <div class="text-xs text-faint" style="text-transform:uppercase;letter-spacing:0.04em">${role}</div>
+        <div style="white-space:pre-wrap;line-height:1.45;font-size:14px">${body}</div>
+      </div>`;
+  };
+  host.innerHTML = _pgChatMessages.map(bubble).join('');
+  // Auto-scroll to the bottom on each render so streaming tokens stay visible.
+  host.scrollTop = host.scrollHeight;
+  const count = document.getElementById('pg-chat-count');
+  if (count) count.textContent = `${_pgChatMessages.length} message(s)`;
 }
 
 function _pgFormatError(e) {

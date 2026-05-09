@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
 import torch
 from fastapi import FastAPI, HTTPException
@@ -47,6 +47,35 @@ from neural_platform.core.config import ExperimentConfig
 # Request / Response schemas (with rich examples for the /docs page)
 # ---------------------------------------------------------------------------
 
+class ChatContentPart(PydanticModel):
+    """One typed slot inside a ChatMessage — text, an image, or audio.
+
+    Multimodal HF chat templates (Gemma-3, Qwen2-VL, LLaVA, Idefics)
+    accept a list of these per message; the modern HF processors know
+    how to render the typed-parts list directly into the model's
+    expected token / pixel sequence.
+    """
+    type:       str = Field(..., description="'text' | 'image' | 'audio'")
+    text:       Optional[str] = Field(None, description="When type='text'.")
+    image_b64:  Optional[str] = Field(None, description="When type='image' — base64 PNG/JPG.")
+    audio_b64:  Optional[str] = Field(None, description="When type='audio' — base64 WAV/MP3/etc.")
+
+
+class ChatMessage(PydanticModel):
+    """One turn of conversation. ``content`` is either a plain string
+    (single-text message — works with every chat template) or a list of
+    typed parts for multimodal turns."""
+    role:    str = Field(..., description="'system' | 'user' | 'assistant'")
+    content: Union[str, List[ChatContentPart]] = Field(
+        ...,
+        description=(
+            "Plain string for text-only turns, or a list of ChatContentParts "
+            "for multimodal (text + image + audio). The server runs "
+            "processor.apply_chat_template(messages, …) to render."
+        ),
+    )
+
+
 class PredictRequest(PydanticModel):
     """
     Flexible prediction request — supply *one* of these fields based on
@@ -56,6 +85,9 @@ class PredictRequest(PydanticModel):
     * **tokens**:    list of token IDs (transformer, when bypassing the tokenizer)
     * **image_b64**: base64-encoded image bytes (CNN)
     * **text**:      raw string (transformer with HuggingFace tokenizer)
+    * **messages**:  list of ChatMessage for multi-turn / chat-template
+                     models (Gemma-3, Qwen2-VL, LLaVA, …). When present,
+                     overrides text/image_b64.
 
     Add `top_k` to control how many predictions you get back.
     """
@@ -133,6 +165,16 @@ class PredictRequest(PydanticModel):
     )
     do_sample: Optional[bool] = Field(
         None, description="Enable sampling for generative tasks (default: greedy)."
+    )
+    messages: Optional[List[ChatMessage]] = Field(
+        None,
+        description=(
+            "Multi-turn chat history. When present and the loaded model "
+            "exposes a chat template, the server runs "
+            "`processor.apply_chat_template(messages, add_generation_prompt=True)` "
+            "and uses the result as the model's input — superseding the "
+            "single-turn `text` / `image_b64` fields."
+        ),
     )
 
     model_config = {
@@ -260,6 +302,14 @@ class InfoResponse(PydanticModel):
     hf_model_id:      Optional[str] = None
     auto_class:       Optional[str] = None
     processor_class:  Optional[str] = None
+    has_chat_template: bool = Field(
+        False,
+        description=(
+            "True when the loaded tokenizer / processor exposes a "
+            "chat_template — drives the Predict tab to surface the "
+            "chat transcript pane instead of the single-turn input."
+        ),
+    )
     # UI hint dictionary derived from the pipeline_specs table — the
     # Predict tab reads this off /info and renders a single universal
     # input panel whose visible fields adapt to the connected model.
@@ -547,6 +597,19 @@ def create_inference_app(config: ExperimentConfig,
             mtype = config.model.type.value
             ui_hint_dict = _native_ui_hint(mtype)
 
+        # Detect chat-template support on the loaded processor /
+        # tokenizer. The Predict UI surfaces a chat transcript pane
+        # whenever this is True, regardless of pipeline_task.
+        has_chat_template = False
+        try:
+            proc = container.get("processor")
+            tok = getattr(proc, "tokenizer", proc)
+            has_chat_template = bool(getattr(tok, "chat_template", None))
+        except Exception:
+            pass
+        if ui_hint_dict is not None:
+            ui_hint_dict = {**ui_hint_dict, "show_chat": has_chat_template}
+
         # If the HF model carries id2label, surface it as class_names so the
         # Predict UI shows real labels instead of bare ids. Honor any class
         # names that were stashed on the checkpoint at training time first
@@ -578,6 +641,7 @@ def create_inference_app(config: ExperimentConfig,
             auto_class=auto_class,
             processor_class=processor_class,
             ui_hint=ui_hint_dict,
+            has_chat_template=has_chat_template,
         )
 
     @app.get("/info/layers", response_model=LayersResponse, tags=["System"], summary="Per-layer breakdown")
@@ -653,6 +717,72 @@ def create_inference_app(config: ExperimentConfig,
               summary="Same as /predict — accepts batched inputs")
     async def predict_batch(request: PredictRequest):
         return await _do_predict(request)
+
+    @app.post("/predict/stream", tags=["Inference"],
+              summary="Stream tokens from a generative model via SSE",
+              responses={
+                  400: {"description": "Task isn't generative — call /predict instead."},
+                  422: {"description": "Input validation failed."},
+                  503: {"description": "Model not loaded yet."},
+              })
+    async def predict_stream(request: PredictRequest):
+        """Token-by-token streaming for generative tasks.
+
+        Returns ``text/event-stream`` with two event types:
+
+          * ``token`` — one per generated piece, ``data: <text>``.
+          * ``done``  — terminator, ``data: {…}`` with final text +
+            latency stats.
+
+        Only fires when the loaded model's pipeline_task has
+        ``needs_generation=True`` in the spec table. Other tasks 400
+        with a clear message — caller should use the regular /predict.
+
+        Long-running. Each server can stream concurrently up to its
+        process budget; cancellation comes from the client closing
+        the connection (StreamingResponse exits via the generator's
+        GeneratorExit and the streamer is allowed to drain).
+        """
+        from neural_platform.core.pipeline_specs import resolve as _resolve_spec
+        from fastapi.responses import StreamingResponse as _SSE
+        spec = (_resolve_spec(config.training.pipeline_task)
+                if config.model.type.value == "hf_pipeline"
+                else _resolve_spec(None))
+        if not spec.needs_generation:
+            raise HTTPException(
+                400,
+                f"Task '{spec.task}' isn't generative — call /predict instead. "
+                f"Streaming is available for: ASR, summarization, translation, "
+                f"text-generation, image-to-text, image-text-to-text, any-to-any.",
+            )
+        model = container.get("model")
+        if model is None:
+            raise HTTPException(503, "Model not loaded")
+
+        # Build the input on the request thread so any 422 surfaces
+        # before we open the SSE connection.
+        try:
+            tensor_input = _build_input(
+                request, config.model.type.value, device, config,
+                container.get("processor"),
+            )
+        except _InputError as exc:
+            raise HTTPException(422, str(exc))
+        except Exception as exc:
+            raise HTTPException(422, f"Input error: {exc}")
+
+        async def event_source():
+            async for chunk in _stream_generation(
+                model=model, processor=container.get("processor"),
+                tensor_input=tensor_input, request=request, spec=spec,
+            ):
+                yield chunk
+
+        return _SSE(event_source(), media_type="text/event-stream", headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        })
 
     # ------------------------------------------------------------------
     # Internal predict runner
@@ -989,6 +1119,13 @@ def _shape_hint(config: ExperimentConfig) -> str:
 def _build_input(request: PredictRequest, model_type: str, device, config: ExperimentConfig, tokenizer):
     """Convert a PredictRequest into the correct tensor format."""
 
+    # Chat short-circuit: when the request carries `messages`, render
+    # via the HF chat template regardless of the underlying model type.
+    # Useful for transformer + hf_pipeline servers that the user wants
+    # to talk to with the chat surface.
+    if request.messages is not None and len(request.messages) > 0 and tokenizer is not None:
+        return _build_chat_input(request, tokenizer, device)
+
     if model_type == "mlp":
         data = request.inputs
         if data is None:
@@ -1166,6 +1303,127 @@ def _build_input(request: PredictRequest, model_type: str, device, config: Exper
     raise _InputError(f"Unknown model type: {model_type}")
 
 
+def _build_chat_input(request: PredictRequest, processor, device):
+    """Render a multi-turn ChatMessage list via the HF chat template.
+
+    Modern HF tokenizers ship a Jinja chat template
+    (``tokenizer.chat_template``) that knows how to format messages for
+    the specific model — system / user / assistant roles, multimodal
+    content parts, generation prompt, etc. We hand the messages to
+    ``processor.apply_chat_template(messages, …)`` and let it produce
+    the right input tensors.
+
+    Falls back to a plain concatenation when no chat template is
+    available — keeps simple text-generation servers usable with the
+    chat surface even on older tokenizers.
+    """
+    if processor is None:
+        raise _InputError(
+            "Chat input requires a loaded processor / tokenizer. "
+            "Restart with a model whose tokenizer is on the Hub."
+        )
+
+    tok = getattr(processor, "tokenizer", processor)
+    has_template = bool(getattr(tok, "chat_template", None))
+
+    # Detect multimodal content first — we only need to decode binary
+    # blobs when we're actually going to feed them to the chat template.
+    # Doing it eagerly would crash the no-template fallback on otherwise
+    # valid (but multimodal) chat sessions before we even get to the
+    # "this model can't accept multimodal chat" error.
+    has_image = any(
+        not isinstance(m.content, str) and any(
+            p.type == "image" and p.image_b64 for p in m.content
+        ) for m in request.messages
+    )
+    has_audio = any(
+        not isinstance(m.content, str) and any(
+            p.type == "audio" and p.audio_b64 for p in m.content
+        ) for m in request.messages
+    )
+
+    # No-template + multimodal: surface the limitation now, before we
+    # spend the cycles to decode the binary blobs.
+    if not has_template and (has_image or has_audio):
+        raise _InputError(
+            "This model has no chat_template; can't accept multimodal chat "
+            "messages without one. Either upgrade the tokenizer or send a "
+            "single-turn request via `text` + `image_b64`."
+        )
+
+    # Now build the message list. For the chat-template path we decode
+    # binary parts to PIL.Image / waveform; for the fallback we only
+    # care about text.
+    msgs = []
+    for m in request.messages:
+        if isinstance(m.content, str):
+            msgs.append({"role": m.role, "content": m.content})
+            continue
+        parts = []
+        for part in m.content:
+            if part.type == "text" and part.text is not None:
+                parts.append({"type": "text", "text": part.text})
+            elif part.type == "image" and part.image_b64 is not None and has_template:
+                # Chat templates (Qwen2-VL / LLaVA / Idefics) want a real
+                # PIL.Image, not the b64 string. Decode lazily — only
+                # touches PIL on the chat-template path.
+                parts.append({"type": "image", "image": _decode_image_b64(part.image_b64)})
+            elif part.type == "audio" and part.audio_b64 is not None and has_template:
+                wav = _decode_audio_b64(
+                    part.audio_b64,
+                    target_sr=_resolve_target_sample_rate(processor),
+                )
+                parts.append({"type": "audio", "audio": wav})
+        msgs.append({"role": m.role, "content": parts})
+
+    # Path 1: native chat template (modern tokenizers / unified processors).
+    if has_template:
+        try:
+            # Newer transformers prefer apply_chat_template returning
+            # tensors directly (return_tensors='pt'); older returns a
+            # plain string we'd then have to tokenize ourselves.
+            try:
+                enc = processor.apply_chat_template(
+                    msgs, add_generation_prompt=True,
+                    tokenize=True, return_tensors="pt", return_dict=True,
+                )
+            except (TypeError, AttributeError):
+                rendered = tok.apply_chat_template(
+                    msgs, add_generation_prompt=True, tokenize=False,
+                )
+                enc = tok(rendered, return_tensors="pt")
+            return {k: (v.to(device) if hasattr(v, "to") else v)
+                     for k, v in dict(enc).items()}
+        except Exception as exc:
+            raise _InputError(
+                f"The chat template rejected the messages: {exc}. "
+                "Try a single-turn `text` field, or trim message roles "
+                "the model doesn't accept (some models reject 'system')."
+            )
+
+    # Path 2: no chat template — concatenate text parts as a fallback.
+    # Loses the role / multimodal information but keeps simple chat
+    # working with vanilla CausalLMs. Multimodal chat was already
+    # rejected above, so by this point everything is text-only.
+    flat = "\n".join(
+        f"{m['role'].upper()}: {m['content']}"
+        if isinstance(m["content"], str)
+        else f"{m['role'].upper()}: " + " ".join(p.get("text", "") for p in m["content"])
+        for m in msgs
+    ) + "\nASSISTANT:"
+    enc = tok(flat, return_tensors="pt", padding=True, truncation=True)
+    return {k: v.to(device) for k, v in dict(enc).items()}
+
+
+def _decode_image_b64(b64: str):
+    """Tiny helper — decode a base64 image into a PIL.Image. Used by
+    the chat path; the regular image input adapter inlines this."""
+    import base64 as _b64
+    import io as _io
+    from PIL import Image
+    return Image.open(_io.BytesIO(_b64.b64decode(b64))).convert("RGB")
+
+
 def _build_hf_pipeline_input(request: PredictRequest, config: ExperimentConfig,
                               device, processor):
     """Dispatch on the configured `pipeline_task`'s spec.
@@ -1188,6 +1446,16 @@ def _build_hf_pipeline_input(request: PredictRequest, config: ExperimentConfig,
     )
     spec = _resolve_spec(config.training.pipeline_task)
     kind = spec.input_kind
+
+    # ----- chat template short-circuit -----------------------------------
+    # When the request carries a `messages` list AND the loaded
+    # processor / tokenizer has a chat template, render via the modern
+    # HF chat path. This wins over the per-task adapter below so a
+    # generic `text-generation` server can host a chat session with no
+    # extra config — the same Gemma-3 / Qwen2-VL / Llama-3 pattern as
+    # the official transformers demos.
+    if request.messages is not None and len(request.messages) > 0:
+        return _build_chat_input(request, processor, device)
 
     # ----- text family ---------------------------------------------------
     if kind in (INPUT_TEXT, INPUT_TEXT_PAIR, INPUT_TEXT_LABELS):
@@ -1525,6 +1793,142 @@ def _lookup_class(class_names: Optional[List[str]], idx: int) -> Optional[str]:
 # Centralizing decode here keeps the input adapter thin and lets us
 # share the audio resampling logic between INPUT_AUDIO and INPUT_ANY
 # without duplication.
+
+async def _stream_generation(*, model, processor, tensor_input, request,
+                              spec) -> "AsyncIterator[str]":
+    """Drive ``model.encoder.generate(streamer=…)`` on a background
+    thread and yield SSE-formatted chunks.
+
+    The generation call is blocking — it spins inside ``transformers``
+    until either max_new_tokens or an EOS token is hit. To deliver
+    tokens to the client as they're produced, we hand
+    ``TextIteratorStreamer`` to ``.generate()``, run that on a thread,
+    and pump the streamer from this async generator.
+
+    Yields strings already wrapped in SSE form (``event: …\\ndata: …\\n\\n``)
+    so the FastAPI ``StreamingResponse`` can emit them directly.
+    """
+    import asyncio
+    import json as _json
+    import threading
+    import time as _time
+    try:
+        from transformers import TextIteratorStreamer
+    except ImportError:
+        yield "event: error\ndata: " + _json.dumps({
+            "detail": "transformers TextIteratorStreamer unavailable. "
+                       "Upgrade transformers or call /predict instead.",
+        }) + "\n\n"
+        return
+
+    encoder = getattr(model, "encoder", model)
+    if not hasattr(encoder, "generate"):
+        yield "event: error\ndata: " + _json.dumps({
+            "detail": f"Loaded model has no .generate() method — task "
+                       f"'{spec.task}' isn't actually streamable here.",
+        }) + "\n\n"
+        return
+
+    # Find the right tokenizer to feed the streamer. For unified
+    # processors (Whisper, BLIP) this lives on .tokenizer; plain
+    # AutoTokenizer instances are themselves the tokenizer.
+    tokenizer = getattr(processor, "tokenizer", processor)
+    if tokenizer is None:
+        yield "event: error\ndata: " + _json.dumps({
+            "detail": "No tokenizer loaded — can't stream decoded text.",
+        }) + "\n\n"
+        return
+
+    streamer = TextIteratorStreamer(
+        tokenizer, skip_prompt=True, skip_special_tokens=True,
+    )
+    gen_inputs = (tensor_input if isinstance(tensor_input, dict)
+                  else {"inputs": tensor_input})
+
+    gen_kwargs: Dict[str, Any] = {"streamer": streamer}
+    if request.max_new_tokens is not None:
+        gen_kwargs["max_new_tokens"] = int(request.max_new_tokens)
+    if request.temperature is not None:
+        gen_kwargs["temperature"] = float(request.temperature)
+    if request.do_sample is not None:
+        gen_kwargs["do_sample"] = bool(request.do_sample)
+    # Sensible default cap so a buggy model can't run forever.
+    gen_kwargs.setdefault("max_new_tokens", 256)
+
+    # Run generate() on a thread — it's a blocking call, and we need
+    # the event loop free to ferry chunks out.
+    error_box: Dict[str, Any] = {}
+    def _run():
+        try:
+            with torch.no_grad():
+                encoder.generate(**gen_inputs, **gen_kwargs)
+        except Exception as exc:
+            error_box["error"] = exc
+            # End the streamer so the consumer loop exits cleanly.
+            try:
+                streamer.end()
+            except Exception:
+                pass
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+    t0 = _time.time()
+    pieces: List[str] = []
+    loop = asyncio.get_event_loop()
+    try:
+        while True:
+            # streamer is a sync iterator; pull next() in a thread so
+            # we don't block the event loop.
+            piece = await loop.run_in_executor(None, _next_or_sentinel,
+                                                  streamer)
+            if piece is _STREAM_END:
+                break
+            pieces.append(piece)
+            yield f"event: token\ndata: {_json.dumps(piece)}\n\n"
+        # generate() exited — wait briefly for the thread to settle so
+        # we capture any post-generation errors.
+        thread.join(timeout=0.5)
+        if "error" in error_box:
+            yield "event: error\ndata: " + _json.dumps({
+                "detail": str(error_box["error"]),
+            }) + "\n\n"
+            return
+        latency_ms = (_time.time() - t0) * 1000
+        yield "event: done\ndata: " + _json.dumps({
+            "text":         "".join(pieces),
+            "latency_ms":   round(latency_ms, 2),
+            "result_kind":  "generated_text",
+        }) + "\n\n"
+    finally:
+        # If the client disconnected mid-stream, the generator gets
+        # closed and we land here. Make sure the worker thread isn't
+        # left hanging on a dead streamer.
+        try:
+            streamer.end()
+        except Exception:
+            pass
+
+
+# Sentinel returned by the executor when the streamer iterator is
+# exhausted. Plain StopIteration doesn't propagate well across
+# run_in_executor boundaries.
+_STREAM_END = object()
+
+
+def _next_or_sentinel(streamer):
+    """Pull one piece off a TextIteratorStreamer.
+
+    Returns ``_STREAM_END`` when the iterator is exhausted. We avoid
+    propagating ``StopIteration`` through the executor because asyncio
+    treats it as a programming error rather than normal completion.
+    """
+    try:
+        return next(streamer)
+    except StopIteration:
+        return _STREAM_END
+    except Exception:
+        return _STREAM_END
+
 
 def _native_ui_hint(model_type: str) -> Dict[str, Any]:
     """UI hint for native (non-HF) model types.

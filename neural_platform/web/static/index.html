@@ -939,6 +939,30 @@ neural init --model transformer --name text_classifier</div>
         </div>
 
         <!--
+          Chat transcript pane — visible only when the connected model
+          exposes a chat_template (info.has_chat_template). Renders a
+          message-bubble history; the universal input panel is hidden
+          while chat is on and a chat composer takes its place.
+        -->
+        <div id="pg-chat" class="hidden">
+          <div id="pg-chat-transcript" style="max-height:360px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;padding:10px 12px;background:var(--bg-elev);margin-bottom:10px;display:flex;flex-direction:column;gap:8px"></div>
+          <div class="row-tight mb-2">
+            <button class="btn btn-ghost btn-xs" onclick="pgChatNew()">+ New chat</button>
+            <span class="text-xs text-faint" id="pg-chat-count"></span>
+          </div>
+          <div class="field">
+            <textarea class="input" id="pg-chat-input" placeholder="Send a message…"
+                       style="min-height:60px"
+                       onkeydown="if(event.key==='Enter' && !event.shiftKey){event.preventDefault();pgChatSend();}"></textarea>
+          </div>
+          <div class="row-tight">
+            <button class="btn btn-ghost btn-xs" onclick="document.getElementById('pg-chat-file').click()">+ Attach image</button>
+            <input type="file" id="pg-chat-file" accept="image/*" class="hidden" onchange="pgChatAttach(this.files[0])" />
+            <span class="text-xs text-faint" id="pg-chat-attach"></span>
+          </div>
+        </div>
+
+        <!--
           Universal input panel — replaces the old pg-mlp / pg-cnn /
           pg-rnn / pg-tx / pg-audio / pg-tabular / pg-video / pg-hf
           panels with a single set of fields whose visibility is driven
@@ -1030,6 +1054,19 @@ neural init --model transformer --name text_classifier</div>
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5,3 19,12 5,21"/></svg>
             Run prediction
           </button>
+          <button class="btn btn-secondary hidden" id="pg-stop" onclick="pgStopStream()">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="6" y="6" width="12" height="12"/></svg>
+            Stop
+          </button>
+          <!-- Streaming toggle: only effective for generative tasks (the
+               server 400s otherwise and the UI falls back to /predict).
+               Visible whenever a server is connected so the choice is
+               surfaced; gates on ui_hint.show_generation_knobs. -->
+          <label class="row-tight hidden" id="pg-stream-toggle"
+                 style="cursor:pointer;padding-left:8px">
+            <input type="checkbox" id="pg-stream" checked />
+            <span class="text-xs text-muted">Stream tokens</span>
+          </label>
           <button class="btn btn-ghost" onclick="pgClearResults()">Clear</button>
           <span class="text-xs text-muted" id="pg-latency"></span>
         </div>

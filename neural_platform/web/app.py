@@ -1832,6 +1832,44 @@ def create_dashboard_app(output_dir: str = "runs") -> FastAPI:
         normalized["wall_latency_ms"] = round(wall_ms, 1)
         return normalized
 
+    @app.post("/api/inference/{server_id}/predict/stream", tags=["Inference"],
+              summary="Stream tokens from a managed generative server (SSE)")
+    async def inference_predict_stream(server_id: str, body: Dict[str, Any], request: Request):
+        """Proxy an SSE token stream from a managed inference server.
+
+        The browser POSTs the same PredictRequest body it would send to
+        ``/predict``. We open a streaming HTTP connection to the
+        inference subprocess (passing its bearer token via header so it
+        stays out of the browser), then forward the SSE chunks back.
+
+        Disconnect handling: when the client closes the connection,
+        FastAPI closes the response generator → ``httpx`` cancels its
+        underlying request → the inference server's ``StreamingResponse``
+        unwinds and the generator's ``finally`` clause stops the
+        ``TextIteratorStreamer``.
+        """
+        from fastapi.responses import StreamingResponse as _SSE
+        try:
+            agen = inference_mgr.proxy_stream(
+                server_id, "/predict/stream", json_body=body,
+            )
+        except KeyError as exc:
+            raise HTTPException(404, str(exc))
+        except RuntimeError as exc:
+            raise HTTPException(502, str(exc))
+
+        async def relay():
+            async for chunk in agen:
+                if await request.is_disconnected():
+                    break
+                yield chunk
+
+        return _SSE(relay(), media_type="text/event-stream", headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        })
+
     @app.get("/api/inference/{server_id}/info", tags=["Inference"],
              summary="Proxy /info from a managed inference server")
     async def inference_info(server_id: str):
