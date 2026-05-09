@@ -861,23 +861,41 @@ neural init --model transformer --name text_classifier</div>
         <div class="field">
           <label class="label">Pipeline task</label>
           <select class="select" id="if-hf-task">
-            <option value="text-classification">text-classification</option>
-            <option value="token-classification">token-classification</option>
-            <option value="zero-shot-classification">zero-shot-classification</option>
-            <option value="fill-mask">fill-mask</option>
-            <option value="text-generation">text-generation</option>
-            <option value="text2text-generation">text2text-generation</option>
-            <option value="summarization">summarization</option>
-            <option value="translation">translation</option>
-            <option value="question-answering">question-answering</option>
-            <option value="image-classification">image-classification</option>
-            <option value="image-segmentation">image-segmentation</option>
-            <option value="object-detection">object-detection</option>
-            <option value="image-to-text">image-to-text</option>
-            <option value="audio-classification">audio-classification</option>
-            <option value="automatic-speech-recognition">automatic-speech-recognition</option>
-            <option value="visual-question-answering">visual-question-answering</option>
-            <option value="feature-extraction">feature-extraction</option>
+            <optgroup label="Text">
+              <option value="text-classification">text-classification</option>
+              <option value="token-classification">token-classification</option>
+              <option value="zero-shot-classification">zero-shot-classification</option>
+              <option value="fill-mask">fill-mask</option>
+              <option value="text-generation">text-generation</option>
+              <option value="text2text-generation">text2text-generation</option>
+              <option value="summarization">summarization</option>
+              <option value="translation">translation</option>
+              <option value="question-answering">question-answering</option>
+              <option value="feature-extraction">feature-extraction</option>
+            </optgroup>
+            <optgroup label="Vision">
+              <option value="image-classification">image-classification</option>
+              <option value="image-segmentation">image-segmentation</option>
+              <option value="object-detection">object-detection</option>
+              <option value="depth-estimation">depth-estimation</option>
+              <option value="image-to-text">image-to-text</option>
+              <option value="image-to-image">image-to-image</option>
+              <option value="zero-shot-image-classification">zero-shot-image-classification</option>
+            </optgroup>
+            <optgroup label="Video">
+              <option value="video-classification">video-classification</option>
+            </optgroup>
+            <optgroup label="Audio">
+              <option value="audio-classification">audio-classification</option>
+              <option value="automatic-speech-recognition">automatic-speech-recognition</option>
+              <option value="voice-activity-detection">voice-activity-detection</option>
+            </optgroup>
+            <optgroup label="Multimodal">
+              <option value="visual-question-answering">visual-question-answering</option>
+              <option value="document-question-answering">document-question-answering</option>
+              <option value="image-text-to-text">image-text-to-text</option>
+              <option value="any-to-any">any-to-any</option>
+            </optgroup>
           </select>
         </div>
         <div id="if-hf-inspect" class="text-xs hidden" style="padding:8px;border:1px solid var(--border);border-radius:8px;margin-bottom:10px"></div>

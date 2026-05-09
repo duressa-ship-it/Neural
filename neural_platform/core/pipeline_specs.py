@@ -5,17 +5,27 @@ Single source of truth that maps every supported HuggingFace
 ``pipeline_tag`` to the **everything else** the platform needs to wire a
 real inference server (or a from-scratch trainer) around it:
 
-  * which ``transformers.Auto*`` class to instantiate
+  * which ``transformers.Auto*`` classes can load it (a fallback chain so
+    we keep working across HF v4 → v5 API drift)
   * which preprocessor to load (tokenizer / feature extractor / image
     processor / unified processor)
   * what shape of input the server endpoint should accept
   * which post-processing path turns the model's outputs into a
     ``Prediction`` list (argmax over logits vs. ``.generate()`` decoded
-    text vs. boxes vs. mask vs. depth)
+    text vs. boxes vs. mask vs. QA span vs. depth)
   * the coarse :class:`core.tasks.Task` enum the validator should pin
     (so synthesized configs validate the same way the Builder does)
   * a default loss + a hint flag describing whether ``output_size`` is
     even meaningful
+
+**Why fallback chains for the Auto class.** The transformers library has
+shifted classes between v4 and v5: ``AutoModelForVision2Seq`` was folded
+into ``AutoModelForImageTextToText`` in v5, ``AutoModelForSemanticSegmentation``
+was renamed ``AutoModelForImageSegmentation``, and so on. Picking a single
+class name leaves us one ``transformers`` upgrade away from a launch-time
+``AttributeError``. The chain lets us prefer the modern name, fall back to
+older names, and finally use a generic ``AutoModel`` so the server boots
+even when the table is slightly behind the installed library.
 
 Until this module existed the spec was scattered:
 
@@ -42,8 +52,8 @@ Every consumer now reads from ``PIPELINE_SPECS`` instead.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional, Tuple
 
 from neural_platform.core.tasks import Task
 
@@ -64,6 +74,7 @@ INPUT_VIDEO_TEXT    = "video+text"
 INPUT_TEXT_PAIR     = "text_pair"        # QA, sentence similarity
 INPUT_TEXT_LABELS   = "text+labels"      # zero-shot classification
 INPUT_IMAGE_LABELS  = "image+labels"     # zero-shot image classification
+INPUT_ANY           = "any"              # any-to-any: route by what's in the request
 INPUT_TENSOR        = "tensor"           # raw float vector (fallback)
 INPUT_NONE          = "none"             # generative-only (text-to-image, etc.)
 
@@ -92,18 +103,33 @@ POSTPROC_GENERATED_VIDEO   = "generated_video"
 
 @dataclass(frozen=True)
 class PipelineSpec:
-    """Everything the server / synthesizer / trainer need for one HF task."""
-    task:              str             # HF pipeline_tag, e.g. "text-classification"
-    coarse_task:       Task            # NeuralForge Task enum value (drives validator + loss)
-    auto_class:        str             # transformers.Auto* class name
-    processor_kind:    str             # which preprocessor to load (PROCESSOR_*)
-    input_kind:        str             # what input shape /predict accepts (INPUT_*)
-    output_kind:       str             # how to render the model's output (POSTPROC_*)
-    needs_generation:  bool = False    # call model.generate() instead of forward()
-    has_class_head:    bool = False    # output_size / num_labels is meaningful
-    default_loss:      str = "cross_entropy"   # for synthesized configs
-    modality:          str = "text"    # primary modality (text / image / audio / video)
-    notes:             str = ""        # human hints (rendered in /info)
+    """Everything the server / synthesizer / trainer need for one HF task.
+
+    ``auto_classes`` is a fallback chain — the wrapper probes
+    ``transformers`` at load time and picks the first name that exists in
+    the installed library. This is the surface that survives v4↔v5 API
+    renames (``AutoModelForVision2Seq`` → ``AutoModelForImageTextToText``,
+    ``AutoModelForSemanticSegmentation`` → ``AutoModelForImageSegmentation``)
+    without us having to pin a transformers version.
+    """
+    task:              str
+    coarse_task:       Task
+    auto_classes:      Tuple[str, ...]   # primary first, then v4/v5 alternates, then AutoModel
+    processor_kind:    str
+    input_kind:        str
+    output_kind:       str
+    needs_generation:  bool = False
+    has_class_head:    bool = False
+    default_loss:      str = "cross_entropy"
+    modality:          str = "text"
+    notes:             str = ""
+
+    @property
+    def auto_class(self) -> str:
+        """Backward-compat alias — returns the preferred (first) Auto class
+        name. Anything that needs the actual loaded class object should
+        call ``resolve_auto_class(transformers, spec)`` instead."""
+        return self.auto_classes[0] if self.auto_classes else "AutoModel"
 
 
 # ---------------------------------------------------------------------------
@@ -112,13 +138,17 @@ class PipelineSpec:
 
 # Add new HF tasks here. Anything missing falls through to a sensible
 # AutoModel + tokenizer default in resolve(); the validator already warns.
+#
+# Auto-class chains: prefer the v5 name first (since that's where HF is
+# moving), then v4 alternates, then a generic fallback. The wrapper picks
+# the first one that the installed transformers actually exposes.
 PIPELINE_SPECS: Dict[str, PipelineSpec] = {
 
     # ===== Text =====
     "text-classification": PipelineSpec(
         task="text-classification",
         coarse_task=Task.TEXT_CLASSIFICATION,
-        auto_class="AutoModelForSequenceClassification",
+        auto_classes=("AutoModelForSequenceClassification",),
         processor_kind=PROCESSOR_TOKENIZER,
         input_kind=INPUT_TEXT,
         output_kind=POSTPROC_LOGITS,
@@ -129,7 +159,7 @@ PIPELINE_SPECS: Dict[str, PipelineSpec] = {
     "token-classification": PipelineSpec(
         task="token-classification",
         coarse_task=Task.TOKEN_CLASSIFICATION,
-        auto_class="AutoModelForTokenClassification",
+        auto_classes=("AutoModelForTokenClassification",),
         processor_kind=PROCESSOR_TOKENIZER,
         input_kind=INPUT_TEXT,
         output_kind=POSTPROC_TOKEN_LOGITS,
@@ -141,7 +171,7 @@ PIPELINE_SPECS: Dict[str, PipelineSpec] = {
     "question-answering": PipelineSpec(
         task="question-answering",
         coarse_task=Task.QUESTION_ANSWERING,
-        auto_class="AutoModelForQuestionAnswering",
+        auto_classes=("AutoModelForQuestionAnswering",),
         processor_kind=PROCESSOR_TOKENIZER,
         input_kind=INPUT_TEXT_PAIR,
         output_kind=POSTPROC_QA_SPANS,
@@ -152,7 +182,7 @@ PIPELINE_SPECS: Dict[str, PipelineSpec] = {
     "summarization": PipelineSpec(
         task="summarization",
         coarse_task=Task.SUMMARIZATION,
-        auto_class="AutoModelForSeq2SeqLM",
+        auto_classes=("AutoModelForSeq2SeqLM",),
         processor_kind=PROCESSOR_TOKENIZER,
         input_kind=INPUT_TEXT,
         output_kind=POSTPROC_GENERATED_TEXT,
@@ -162,7 +192,7 @@ PIPELINE_SPECS: Dict[str, PipelineSpec] = {
     "translation": PipelineSpec(
         task="translation",
         coarse_task=Task.TRANSLATION,
-        auto_class="AutoModelForSeq2SeqLM",
+        auto_classes=("AutoModelForSeq2SeqLM",),
         processor_kind=PROCESSOR_TOKENIZER,
         input_kind=INPUT_TEXT,
         output_kind=POSTPROC_GENERATED_TEXT,
@@ -172,7 +202,7 @@ PIPELINE_SPECS: Dict[str, PipelineSpec] = {
     "text-generation": PipelineSpec(
         task="text-generation",
         coarse_task=Task.TEXT_GENERATION,
-        auto_class="AutoModelForCausalLM",
+        auto_classes=("AutoModelForCausalLM",),
         processor_kind=PROCESSOR_TOKENIZER,
         input_kind=INPUT_TEXT,
         output_kind=POSTPROC_GENERATED_TEXT,
@@ -182,7 +212,7 @@ PIPELINE_SPECS: Dict[str, PipelineSpec] = {
     "text2text-generation": PipelineSpec(
         task="text2text-generation",
         coarse_task=Task.TEXT_GENERATION,
-        auto_class="AutoModelForSeq2SeqLM",
+        auto_classes=("AutoModelForSeq2SeqLM",),
         processor_kind=PROCESSOR_TOKENIZER,
         input_kind=INPUT_TEXT,
         output_kind=POSTPROC_GENERATED_TEXT,
@@ -192,7 +222,7 @@ PIPELINE_SPECS: Dict[str, PipelineSpec] = {
     "fill-mask": PipelineSpec(
         task="fill-mask",
         coarse_task=Task.FILL_MASK,
-        auto_class="AutoModelForMaskedLM",
+        auto_classes=("AutoModelForMaskedLM",),
         processor_kind=PROCESSOR_TOKENIZER,
         input_kind=INPUT_TEXT,
         output_kind=POSTPROC_LOGITS,
@@ -201,7 +231,7 @@ PIPELINE_SPECS: Dict[str, PipelineSpec] = {
     "feature-extraction": PipelineSpec(
         task="feature-extraction",
         coarse_task=Task.FEATURE_EXTRACTION,
-        auto_class="AutoModel",
+        auto_classes=("AutoModel",),
         processor_kind=PROCESSOR_TOKENIZER,
         input_kind=INPUT_TEXT,
         output_kind=POSTPROC_EMBEDDINGS,
@@ -210,7 +240,7 @@ PIPELINE_SPECS: Dict[str, PipelineSpec] = {
     "sentence-similarity": PipelineSpec(
         task="sentence-similarity",
         coarse_task=Task.SENTENCE_SIMILARITY,
-        auto_class="AutoModel",
+        auto_classes=("AutoModel",),
         processor_kind=PROCESSOR_TOKENIZER,
         input_kind=INPUT_TEXT_PAIR,
         output_kind=POSTPROC_EMBEDDINGS,
@@ -219,7 +249,7 @@ PIPELINE_SPECS: Dict[str, PipelineSpec] = {
     "zero-shot-classification": PipelineSpec(
         task="zero-shot-classification",
         coarse_task=Task.ZERO_SHOT_CLASSIFICATION,
-        auto_class="AutoModelForSequenceClassification",
+        auto_classes=("AutoModelForSequenceClassification",),
         processor_kind=PROCESSOR_TOKENIZER,
         input_kind=INPUT_TEXT_LABELS,
         output_kind=POSTPROC_LOGITS,
@@ -231,7 +261,7 @@ PIPELINE_SPECS: Dict[str, PipelineSpec] = {
     "image-classification": PipelineSpec(
         task="image-classification",
         coarse_task=Task.IMAGE_CLASSIFICATION,
-        auto_class="AutoModelForImageClassification",
+        auto_classes=("AutoModelForImageClassification",),
         processor_kind=PROCESSOR_IMAGE,
         input_kind=INPUT_IMAGE,
         output_kind=POSTPROC_LOGITS,
@@ -241,7 +271,10 @@ PIPELINE_SPECS: Dict[str, PipelineSpec] = {
     "image-segmentation": PipelineSpec(
         task="image-segmentation",
         coarse_task=Task.IMAGE_SEGMENTATION,
-        auto_class="AutoModelForSemanticSegmentation",
+        # v5 renamed `Semantic` → `Image`. Keep both so older transformers
+        # versions still resolve.
+        auto_classes=("AutoModelForImageSegmentation",
+                       "AutoModelForSemanticSegmentation"),
         processor_kind=PROCESSOR_IMAGE,
         input_kind=INPUT_IMAGE,
         output_kind=POSTPROC_MASKS,
@@ -250,7 +283,7 @@ PIPELINE_SPECS: Dict[str, PipelineSpec] = {
     "object-detection": PipelineSpec(
         task="object-detection",
         coarse_task=Task.OBJECT_DETECTION,
-        auto_class="AutoModelForObjectDetection",
+        auto_classes=("AutoModelForObjectDetection",),
         processor_kind=PROCESSOR_IMAGE,
         input_kind=INPUT_IMAGE,
         output_kind=POSTPROC_BOXES,
@@ -259,7 +292,7 @@ PIPELINE_SPECS: Dict[str, PipelineSpec] = {
     "depth-estimation": PipelineSpec(
         task="depth-estimation",
         coarse_task=Task.DEPTH_ESTIMATION,
-        auto_class="AutoModelForDepthEstimation",
+        auto_classes=("AutoModelForDepthEstimation",),
         processor_kind=PROCESSOR_IMAGE,
         input_kind=INPUT_IMAGE,
         output_kind=POSTPROC_DEPTH,
@@ -269,8 +302,8 @@ PIPELINE_SPECS: Dict[str, PipelineSpec] = {
     "zero-shot-image-classification": PipelineSpec(
         task="zero-shot-image-classification",
         coarse_task=Task.ZERO_SHOT_IMAGE_CLASSIF,
-        auto_class="AutoModelForZeroShotImageClassification",
-        processor_kind=PROCESSOR_PROCESSOR,        # CLIP-style — image + text together
+        auto_classes=("AutoModelForZeroShotImageClassification",),
+        processor_kind=PROCESSOR_PROCESSOR,
         input_kind=INPUT_IMAGE_LABELS,
         output_kind=POSTPROC_LOGITS,
         modality="image",
@@ -278,17 +311,39 @@ PIPELINE_SPECS: Dict[str, PipelineSpec] = {
     "image-to-text": PipelineSpec(
         task="image-to-text",
         coarse_task=Task.IMAGE_TO_TEXT,
-        auto_class="AutoModelForVision2Seq",
-        processor_kind=PROCESSOR_PROCESSOR,        # image processor + tokenizer
+        # v5: AutoModelForVision2Seq was removed — folded into
+        # AutoModelForImageTextToText. TrOCR-style classic image-captioning
+        # models can also be loaded as VisionEncoderDecoderModel directly.
+        # AutoModelForTextRecognition is the v5 OCR-specific class.
+        auto_classes=("AutoModelForImageTextToText",
+                       "AutoModelForVision2Seq",
+                       "AutoModelForTextRecognition",
+                       "VisionEncoderDecoderModel"),
+        processor_kind=PROCESSOR_PROCESSOR,
         input_kind=INPUT_IMAGE,
         output_kind=POSTPROC_GENERATED_TEXT,
         needs_generation=True,
+        modality="image",
+        notes=(
+            "Vision-to-text path: TrOCR / BLIP-style captioners. The chain "
+            "tries the v5 unified class first and falls back to the legacy "
+            "Vision2Seq / VisionEncoderDecoder names so the server boots "
+            "regardless of installed transformers version."
+        ),
+    ),
+    "image-to-image": PipelineSpec(
+        task="image-to-image",
+        coarse_task=Task.IMAGE_TO_IMAGE,
+        auto_classes=("AutoModelForImageToImage",),
+        processor_kind=PROCESSOR_IMAGE,
+        input_kind=INPUT_IMAGE,
+        output_kind=POSTPROC_GENERATED_IMAGE,
         modality="image",
     ),
     "keypoint-detection": PipelineSpec(
         task="keypoint-detection",
         coarse_task=Task.KEYPOINT_DETECTION,
-        auto_class="AutoModelForKeypointDetection",
+        auto_classes=("AutoModelForKeypointDetection",),
         processor_kind=PROCESSOR_IMAGE,
         input_kind=INPUT_IMAGE,
         output_kind=POSTPROC_KEYPOINTS,
@@ -299,8 +354,8 @@ PIPELINE_SPECS: Dict[str, PipelineSpec] = {
     "video-classification": PipelineSpec(
         task="video-classification",
         coarse_task=Task.VIDEO_CLASSIFICATION,
-        auto_class="AutoModelForVideoClassification",
-        processor_kind=PROCESSOR_IMAGE,           # HF video models reuse image processors
+        auto_classes=("AutoModelForVideoClassification",),
+        processor_kind=PROCESSOR_IMAGE,
         input_kind=INPUT_VIDEO,
         output_kind=POSTPROC_LOGITS,
         has_class_head=True,
@@ -311,7 +366,7 @@ PIPELINE_SPECS: Dict[str, PipelineSpec] = {
     "audio-classification": PipelineSpec(
         task="audio-classification",
         coarse_task=Task.AUDIO_CLASSIFICATION,
-        auto_class="AutoModelForAudioClassification",
+        auto_classes=("AutoModelForAudioClassification",),
         processor_kind=PROCESSOR_FEATURE_EXTRACTOR,
         input_kind=INPUT_AUDIO,
         output_kind=POSTPROC_LOGITS,
@@ -321,8 +376,8 @@ PIPELINE_SPECS: Dict[str, PipelineSpec] = {
     "automatic-speech-recognition": PipelineSpec(
         task="automatic-speech-recognition",
         coarse_task=Task.AUTOMATIC_SPEECH_RECOGNITION,
-        auto_class="AutoModelForSpeechSeq2Seq",
-        processor_kind=PROCESSOR_PROCESSOR,        # WhisperProcessor / Wav2Vec2Processor
+        auto_classes=("AutoModelForSpeechSeq2Seq",),
+        processor_kind=PROCESSOR_PROCESSOR,
         input_kind=INPUT_AUDIO,
         output_kind=POSTPROC_GENERATED_TEXT,
         needs_generation=True,
@@ -337,7 +392,7 @@ PIPELINE_SPECS: Dict[str, PipelineSpec] = {
     "voice-activity-detection": PipelineSpec(
         task="voice-activity-detection",
         coarse_task=Task.VOICE_ACTIVITY_DETECTION,
-        auto_class="AutoModelForAudioClassification",
+        auto_classes=("AutoModelForAudioClassification",),
         processor_kind=PROCESSOR_FEATURE_EXTRACTOR,
         input_kind=INPUT_AUDIO,
         output_kind=POSTPROC_LOGITS,
@@ -348,7 +403,10 @@ PIPELINE_SPECS: Dict[str, PipelineSpec] = {
     "visual-question-answering": PipelineSpec(
         task="visual-question-answering",
         coarse_task=Task.VISUAL_QUESTION_ANSWERING,
-        auto_class="AutoModelForVisualQuestionAnswering",
+        # AutoModelForVisualQuestionAnswering exists in v4 + v5; modern VQA
+        # models also surface as ImageTextToText (BLIP, LLaVA, …).
+        auto_classes=("AutoModelForVisualQuestionAnswering",
+                       "AutoModelForImageTextToText"),
         processor_kind=PROCESSOR_PROCESSOR,
         input_kind=INPUT_IMAGE_TEXT,
         output_kind=POSTPROC_LOGITS,
@@ -358,7 +416,8 @@ PIPELINE_SPECS: Dict[str, PipelineSpec] = {
     "document-question-answering": PipelineSpec(
         task="document-question-answering",
         coarse_task=Task.DOCUMENT_QUESTION_ANSWERING,
-        auto_class="AutoModelForDocumentQuestionAnswering",
+        auto_classes=("AutoModelForDocumentQuestionAnswering",
+                       "AutoModelForImageTextToText"),
         processor_kind=PROCESSOR_PROCESSOR,
         input_kind=INPUT_IMAGE_TEXT,
         output_kind=POSTPROC_QA_SPANS,
@@ -367,12 +426,52 @@ PIPELINE_SPECS: Dict[str, PipelineSpec] = {
     "image-text-to-text": PipelineSpec(
         task="image-text-to-text",
         coarse_task=Task.IMAGE_TEXT_TO_TEXT,
-        auto_class="AutoModelForImageTextToText",
+        # Modern HF unified-multimodal: LLaVA, BLIP-2, Idefics, Qwen-VL,
+        # Gemma-3 vision, etc. v5 dropped Vision2Seq; we keep it as a v4
+        # fallback. CausalLM is a last resort for plain decoder-only
+        # multimodal LMs that don't expose the unified Auto class.
+        auto_classes=("AutoModelForImageTextToText",
+                       "AutoModelForVision2Seq",
+                       "AutoModelForCausalLM"),
         processor_kind=PROCESSOR_PROCESSOR,
         input_kind=INPUT_IMAGE_TEXT,
         output_kind=POSTPROC_GENERATED_TEXT,
         needs_generation=True,
         modality="image",
+    ),
+    "any-to-any": PipelineSpec(
+        task="any-to-any",
+        coarse_task=Task.ANY_TO_ANY,
+        # Unified multimodal LMs (Gemma-3, Phi-3.5-vision, Qwen2-VL, etc.)
+        # The chain prefers ImageTextToText (most common), falls back to
+        # CausalLM (decoder-only LMs), and finally AutoModel for the
+        # ungainly cases. Routing on the input side happens via
+        # input_kind=INPUT_ANY: whatever the request carries (image / text /
+        # audio / mix) gets dispatched to the processor's unified call.
+        auto_classes=("AutoModelForImageTextToText",
+                       "AutoModelForCausalLM",
+                       "AutoModelForSeq2SeqLM",
+                       "AutoModel"),
+        processor_kind=PROCESSOR_PROCESSOR,
+        input_kind=INPUT_ANY,
+        output_kind=POSTPROC_GENERATED_TEXT,
+        needs_generation=True,
+        modality="any",
+        notes=(
+            "Any-to-any wraps unified multimodal LMs (Gemma-3, Qwen2-VL, "
+            "Phi-3.5-vision). The processor accepts whichever combination "
+            "of `text` / `image_b64` / `inputs` (audio) is present in the "
+            "request; the server runs `.generate()` and decodes the output."
+        ),
+    ),
+    "table-question-answering": PipelineSpec(
+        task="table-question-answering",
+        coarse_task=Task.TABLE_QUESTION_ANSWERING,
+        auto_classes=("AutoModelForTableQuestionAnswering",),
+        processor_kind=PROCESSOR_TOKENIZER,
+        input_kind=INPUT_TEXT_PAIR,
+        output_kind=POSTPROC_LOGITS,
+        modality="text",
     ),
 }
 
@@ -386,7 +485,7 @@ PIPELINE_SPECS: Dict[str, PipelineSpec] = {
 _DEFAULT_SPEC = PipelineSpec(
     task="custom",
     coarse_task=Task.CUSTOM,
-    auto_class="AutoModel",
+    auto_classes=("AutoModel",),
     processor_kind=PROCESSOR_TOKENIZER,
     input_kind=INPUT_TENSOR,
     output_kind=POSTPROC_EMBEDDINGS,
@@ -411,6 +510,40 @@ def resolve(pipeline_task: Optional[str]) -> PipelineSpec:
 def supported_tasks() -> list[str]:
     """All pipeline_tag strings the table knows. UI uses this for dropdowns."""
     return sorted(PIPELINE_SPECS.keys())
+
+
+def resolve_auto_class(transformers_module: Any, spec: PipelineSpec
+                        ) -> Tuple[Any, str]:
+    """Probe ``transformers`` for the first auto-class in the spec's chain
+    that actually exists in the installed library.
+
+    Returns ``(class, name)``. Raises ``RuntimeError`` listing every name
+    we tried when none resolve — keeps the failure message actionable
+    instead of leaving the user staring at the v4 class name and wondering
+    whether to upgrade or downgrade.
+    """
+    tried: list[str] = []
+    for name in spec.auto_classes:
+        tried.append(name)
+        try:
+            cls = getattr(transformers_module, name)
+        except (AttributeError, ImportError):
+            continue
+        if cls is not None:
+            return cls, name
+    # Last-ditch: AutoModel is in every transformers release. Surface it as
+    # a soft fallback so the server doesn't crash at startup; predict-time
+    # output handling will degrade to embeddings (which is at least
+    # debuggable) instead of a 500 on the lifespan hook.
+    fallback = getattr(transformers_module, "AutoModel", None)
+    if fallback is not None:
+        tried.append("AutoModel")
+        return fallback, "AutoModel"
+    raise RuntimeError(
+        f"None of {spec.auto_classes!r} are exposed by the installed "
+        f"transformers library, and AutoModel itself is missing. "
+        f"Tried: {tried}. Upgrade transformers or pick a different task."
+    )
 
 
 # Translates a PROCESSOR_* constant to the transformers Auto* class name.

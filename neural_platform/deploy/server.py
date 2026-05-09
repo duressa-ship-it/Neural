@@ -74,8 +74,39 @@ class PredictRequest(PydanticModel):
     text: Optional[str] = Field(
         None, description="Raw text — server tokenizes via HuggingFace AutoTokenizer"
     )
+    context: Optional[str] = Field(
+        None,
+        description=(
+            "Passage / context paragraph for question-answering and similar "
+            "text-pair tasks. The server pairs `text` (the question) with "
+            "`context` (the passage) when the loaded model's pipeline_task "
+            "is question-answering or text-pair-shaped."
+        ),
+    )
+    candidate_labels: Optional[List[str]] = Field(
+        None,
+        description=(
+            "Candidate labels for zero-shot classification. Pass alongside "
+            "`text` for text zero-shot or `image_b64` for CLIP-style image "
+            "zero-shot. The server runs NLI / contrastive matching across "
+            "the labels and returns scores per label."
+        ),
+    )
     top_k: int = Field(5, ge=1, le=100, description="How many top predictions to return")
     return_probabilities: bool = Field(True, description="Include softmax probabilities")
+    # Generation knobs (used for ASR / summarization / translation / image-to-text /
+    # text-generation / image-text-to-text / any-to-any). All optional —
+    # the server falls back to the model's HF generation config defaults.
+    max_new_tokens: Optional[int] = Field(
+        None, ge=1, le=4096,
+        description="Cap the number of generated tokens. Defaults to the model's HF generation config.",
+    )
+    temperature: Optional[float] = Field(
+        None, ge=0.0, le=2.0, description="Sampling temperature for generative tasks."
+    )
+    do_sample: Optional[bool] = Field(
+        None, description="Enable sampling for generative tasks (default: greedy)."
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -569,6 +600,8 @@ def create_inference_app(config: ExperimentConfig,
         # the default (POSTPROC_LOGITS, no generation).
         from neural_platform.core.pipeline_specs import (
             resolve as _resolve_spec, POSTPROC_GENERATED_TEXT,
+            POSTPROC_QA_SPANS, POSTPROC_BOXES, POSTPROC_MASKS, POSTPROC_DEPTH,
+            POSTPROC_TOKEN_LOGITS,
         )
         spec = (_resolve_spec(config.training.pipeline_task)
                 if model_type == "hf_pipeline"
@@ -577,11 +610,11 @@ def create_inference_app(config: ExperimentConfig,
         with torch.no_grad():
             try:
                 # ---- generative path (.generate + decode) -----------------
-                # Whisper / BART / T5 / GPT-style models. Calling the
-                # forward pass and softmaxing the logits gives token-step
-                # probabilities — useless for the user, who wants the
-                # decoded string. Run .generate() on the underlying HF
-                # encoder and decode via the loaded processor.
+                # Whisper / BART / T5 / GPT / image-to-text / image-text-to-text
+                # / any-to-any. Calling the forward pass and softmaxing the
+                # logits gives token-step probabilities — useless for the
+                # user. Run .generate() on the underlying HF encoder and
+                # decode via the loaded processor.
                 if spec.needs_generation:
                     encoder = getattr(model, "encoder", model)
                     proc = container.get("processor")
@@ -594,7 +627,15 @@ def create_inference_app(config: ExperimentConfig,
                         )
                     gen_inputs = (tensor_input if isinstance(tensor_input, dict)
                                   else {"inputs": tensor_input})
-                    generated = encoder.generate(**gen_inputs)
+                    # Forward generation kwargs from the request.
+                    gen_kwargs: Dict[str, Any] = {}
+                    if request.max_new_tokens is not None:
+                        gen_kwargs["max_new_tokens"] = int(request.max_new_tokens)
+                    if request.temperature is not None:
+                        gen_kwargs["temperature"] = float(request.temperature)
+                    if request.do_sample is not None:
+                        gen_kwargs["do_sample"] = bool(request.do_sample)
+                    generated = encoder.generate(**gen_inputs, **gen_kwargs)
                     text = None
                     if proc is not None:
                         try:
@@ -603,7 +644,13 @@ def create_inference_app(config: ExperimentConfig,
                             )
                             text = decoded[0] if decoded else None
                         except Exception:
-                            text = None
+                            # Fall back to .tokenizer.decode for processors that
+                            # don't expose batch_decode (rare, older HF).
+                            try:
+                                tok = getattr(proc, "tokenizer", proc)
+                                text = tok.decode(generated[0], skip_special_tokens=True)
+                            except Exception:
+                                text = None
                     latency_ms = (time.time() - t0) * 1000
                     # Surface the decoded text as a single Prediction with
                     # `class_name` carrying the string. The Predict UI
@@ -623,11 +670,11 @@ def create_inference_app(config: ExperimentConfig,
 
                 # ---- non-generative path (existing behavior) -------------
                 if isinstance(tensor_input, dict):
-                    logits = model(**tensor_input)
+                    raw_output = model(**tensor_input)
                 elif isinstance(tensor_input, (list, tuple)):
-                    logits = model(*tensor_input)
+                    raw_output = model(*tensor_input)
                 else:
-                    logits = model(tensor_input)
+                    raw_output = model(tensor_input)
             except HTTPException:
                 raise
             except RuntimeError as e:
@@ -640,6 +687,45 @@ def create_inference_app(config: ExperimentConfig,
                 )
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Inference error: {e}")
+
+        # ---- structured-output post-processing ---------------------------
+        # The HF wrapper returns either a tensor of logits (the common
+        # case) or the full HF output object for tasks that need multiple
+        # tensors (QA = start_logits + end_logits; object detection = boxes
+        # + scores; depth = predicted_depth; segmentation = logits + masks).
+        # Branch on spec.output_kind so each task gets a coherent response
+        # shape rather than 500ing on a missing .dim() attribute.
+        if spec.output_kind == POSTPROC_QA_SPANS and not isinstance(raw_output, torch.Tensor):
+            return _qa_response(raw_output, tensor_input, container.get("processor"),
+                                 model_type, t0)
+
+        if spec.output_kind == POSTPROC_BOXES and not isinstance(raw_output, torch.Tensor):
+            return _boxes_response(raw_output, model_type, t0,
+                                    class_names_fn=lambda i: _lookup_class(class_names, i))
+
+        if spec.output_kind == POSTPROC_DEPTH and not isinstance(raw_output, torch.Tensor):
+            return _depth_response(raw_output, model_type, t0)
+
+        if spec.output_kind == POSTPROC_MASKS and not isinstance(raw_output, torch.Tensor):
+            return _masks_response(raw_output, model_type, t0)
+
+        # Anything else: treat the output as logits. If we still got a
+        # structured output (e.g. an unknown HF output shape), pull
+        # `.logits` off it — the wrapper would normally do that, but a
+        # custom auto class might bypass the wrapper.
+        if isinstance(raw_output, torch.Tensor):
+            logits = raw_output
+        elif hasattr(raw_output, "logits"):
+            logits = raw_output.logits
+        elif hasattr(raw_output, "last_hidden_state"):
+            logits = raw_output.last_hidden_state
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Model returned a {type(raw_output).__name__} the server "
+                       f"doesn't know how to render. Task '{spec.task}' may need a "
+                       "purpose-built postprocessor — file an issue with the model id.",
+            )
 
         latency_ms = (time.time() - t0) * 1000
 
@@ -992,6 +1078,7 @@ def _build_hf_pipeline_input(request: PredictRequest, config: ExperimentConfig,
         INPUT_TEXT, INPUT_TEXT_PAIR, INPUT_TEXT_LABELS,
         INPUT_IMAGE, INPUT_IMAGE_LABELS, INPUT_IMAGE_TEXT,
         INPUT_AUDIO, INPUT_AUDIO_TEXT, INPUT_VIDEO, INPUT_TENSOR,
+        INPUT_ANY,
     )
     spec = _resolve_spec(config.training.pipeline_task)
     kind = spec.input_kind
@@ -1013,18 +1100,73 @@ def _build_hf_pipeline_input(request: PredictRequest, config: ExperimentConfig,
                 "client and send 'tokens' instead, or restart with a model "
                 "whose tokenizer is on the Hub."
             )
+        # For QA / text-pair tasks the user sends `text` (question) +
+        # `context` (passage). HF tokenizers accept these as a positional
+        # pair, which is what the model's forward expects.
         try:
-            enc = processor(
-                request.text,
-                max_length=128,
-                padding="max_length", truncation=True, return_tensors="pt",
-            )
+            if kind == INPUT_TEXT_PAIR and request.context:
+                enc = processor(
+                    request.text, request.context,
+                    max_length=384,
+                    padding="max_length", truncation=True, return_tensors="pt",
+                )
+            else:
+                enc = processor(
+                    request.text,
+                    max_length=128,
+                    padding="max_length", truncation=True, return_tensors="pt",
+                )
         except Exception as exc:
             raise _InputError(
                 f"The processor for {spec.task} couldn't tokenize the input: {exc}. "
                 "Try sending pre-tokenized `tokens` instead."
             )
         return {k: v.to(device) for k, v in enc.items()}
+
+    # ----- any-to-any: dispatch on whichever fields the request carries ---
+    if kind == INPUT_ANY:
+        # Unified multimodal LMs (Gemma-3, Qwen2-VL, Phi-3.5-vision) accept
+        # whatever combination the user supplies — text alone, image alone,
+        # image+text, audio+text, etc. We hand the bundle to the processor
+        # and let it route by what's present.
+        if processor is None:
+            raise _InputError(
+                "Any-to-any models need a loaded HF processor (AutoProcessor). "
+                "Restart the server with a model whose processor is on the Hub."
+            )
+        proc_kwargs: Dict[str, Any] = {}
+        if request.text is not None:
+            proc_kwargs["text"] = request.text
+        if request.image_b64 is not None:
+            import base64, io
+            from PIL import Image
+            proc_kwargs["images"] = Image.open(
+                io.BytesIO(base64.b64decode(request.image_b64))
+            ).convert("RGB")
+        if request.inputs is not None:
+            # Treat numeric `inputs` as raw audio waveform — most common
+            # any-to-any audio path.
+            wav = request.inputs
+            if isinstance(wav, list) and wav and isinstance(wav[0], list):
+                wav = wav[0]
+            proc_kwargs["audio"] = [float(x) for x in wav]
+            proc_kwargs.setdefault("sampling_rate", 16000)
+        if not proc_kwargs:
+            raise _InputError(
+                f"Task '{spec.task}' needs at least one of `text`, `image_b64`, "
+                "or `inputs` (audio waveform)."
+            )
+        proc_kwargs["return_tensors"] = "pt"
+        try:
+            enc = processor(**proc_kwargs)
+        except Exception as exc:
+            raise _InputError(
+                f"Any-to-any processor rejected the input bundle: {exc}. "
+                "Verify the model's expected modalities and try again."
+            )
+        # Some processors return a dict-like BatchEncoding; some return
+        # plain dicts. Both are iterable as dict so we treat them uniformly.
+        return {k: (v.to(device) if hasattr(v, "to") else v) for k, v in dict(enc).items()}
 
     # ----- image family --------------------------------------------------
     if kind == INPUT_IMAGE:
@@ -1170,20 +1312,55 @@ def _build_predictions(
     return_probs: bool,
     class_names: Optional[List[str]],
 ) -> List[Prediction]:
-    """Convert raw logits into a list of Prediction objects."""
-    if logits.size(0) == 1:
-        # Binary or single-output regression head
-        prob = torch.sigmoid(logits).item()
+    """Convert raw logits into a list of Prediction objects.
+
+    Robust to whatever shape the upstream model returns — token-classification
+    models can emit ``(seq_len, num_classes)``, single-class HF heads emit
+    ``(1, num_classes)`` even after the batch dim is iterated over, and
+    legacy classifiers emit a 1-D ``(num_classes,)``. The previous
+    implementation dispatched on ``size(0) == 1`` (the leading dim) which
+    spuriously matched single-token / single-batch multi-class outputs and
+    crashed inside ``torch.sigmoid(logits).item()`` with "a Tensor with N
+    elements cannot be converted to Scalar".
+
+    The fix:
+      * Squeeze leading singleton dims so a ``(1, 1, num_classes)`` or
+        ``(1, num_classes)`` collapses to ``(num_classes,)`` before we
+        decide.
+      * For token-classification (``(seq_len, num_classes)`` after squeeze),
+        average over the sequence axis to produce a single distribution —
+        not perfect but actionable, and the top-k is meaningful.
+      * Dispatch on ``numel() == 1`` to detect the *true* scalar branch
+        (binary / regression with a single-output head). Multi-class always
+        runs softmax + topk regardless of leading singletons.
+    """
+    # Drop any leading singleton dims so we work with a flat class vector.
+    while logits.dim() > 1 and logits.size(0) == 1:
+        logits = logits.squeeze(0)
+
+    # Token-level classification: (seq_len, num_classes). Average across
+    # the sequence axis to surface document-level top-k. The dedicated
+    # POSTPROC_TOKEN_LOGITS path in the server runs *before* this for
+    # callers that want per-token output.
+    if logits.dim() >= 2:
+        logits = logits.mean(dim=tuple(range(logits.dim() - 1)))
+
+    if logits.numel() == 1:
+        # True scalar — single-output regression head or binary
+        # classification with a single logit. Sigmoid → probability.
+        score = float(logits.flatten()[0].item())
+        prob = float(torch.sigmoid(logits.flatten()).item())
         label = int(prob > 0.5)
         return [Prediction(
             label=label,
             class_name=_lookup_class(class_names, label),
             probability=round(prob, 6) if return_probs else None,
-            score=round(float(logits[0].item()), 6),
+            score=round(score, 6),
         )]
 
-    probs = torch.softmax(logits, dim=0)
-    k = min(top_k, logits.size(0))
+    # Multi-class: softmax + topk over the class axis.
+    probs = torch.softmax(logits, dim=-1)
+    k = min(top_k, logits.size(-1))
     top_probs, top_labels = probs.topk(k)
     return [
         Prediction(
@@ -1202,3 +1379,160 @@ def _lookup_class(class_names: Optional[List[str]], idx: int) -> Optional[str]:
     if 0 <= idx < len(class_names):
         return class_names[idx]
     return None
+
+
+# ---------------------------------------------------------------------------
+# Structured-output postprocessors
+# ---------------------------------------------------------------------------
+# Each of these takes the bare HF output object that the wrapper passed
+# through (start_logits + end_logits for QA, pred_boxes + scores for
+# object detection, etc.) and turns it into a PredictResponse the Predict
+# UI can render. Surface area is deliberately the same as the
+# logits-based path: a single-sample top-K list with `class_name`
+# carrying the human-readable answer.
+
+def _qa_response(outputs, tensor_input, processor, model_type: str,
+                 t0: float) -> "PredictResponse":
+    """Decode a question-answering structured output to a span string.
+
+    HF QA models return ``QuestionAnsweringModelOutput(start_logits,
+    end_logits, …)``. The "answer" is the contiguous token span between
+    argmax(start) and argmax(end) — we slice that out of the original
+    ``input_ids`` and decode it back to text via the tokenizer half of the
+    processor (or the processor itself when it's a plain tokenizer).
+    """
+    start_logits = outputs.start_logits
+    end_logits = outputs.end_logits
+    # Take the first (and only — we batch=1) sample.
+    s_logits = start_logits[0] if start_logits.dim() > 1 else start_logits
+    e_logits = end_logits[0] if end_logits.dim() > 1 else end_logits
+    start = int(torch.argmax(s_logits).item())
+    end = int(torch.argmax(e_logits).item())
+    if end < start:
+        # Models occasionally pick spans in reverse; clamp gracefully.
+        start, end = end, start
+    # Confidence: softmax(start) * softmax(end). Useful for ranking, even
+    # if not strictly calibrated.
+    s_prob = float(torch.softmax(s_logits, dim=-1)[start].item())
+    e_prob = float(torch.softmax(e_logits, dim=-1)[end].item())
+    confidence = s_prob * e_prob
+
+    # Decode the span — input_ids live in the tensor_input dict.
+    answer = "(no input_ids in request)"
+    input_ids = tensor_input.get("input_ids") if isinstance(tensor_input, dict) else None
+    if input_ids is not None and processor is not None:
+        try:
+            tokenizer = getattr(processor, "tokenizer", processor)
+            ids = input_ids[0] if input_ids.dim() > 1 else input_ids
+            span = ids[start:end + 1]
+            answer = tokenizer.decode(span, skip_special_tokens=True)
+        except Exception as exc:
+            answer = f"(decode failed: {exc})"
+
+    latency_ms = (time.time() - t0) * 1000
+    return PredictResponse(
+        predictions=[[Prediction(
+            label=0,
+            class_name=answer.strip() or "(empty span)",
+            probability=round(confidence, 6),
+            score=None,
+        )]],
+        model_type=model_type,
+        latency_ms=round(latency_ms, 2),
+    )
+
+
+def _boxes_response(outputs, model_type: str, t0: float, class_names_fn
+                     ) -> "PredictResponse":
+    """Render object-detection output as one Prediction per detected box.
+
+    Shape: each Prediction's ``class_name`` carries
+    ``"<label> @ x1,y1,x2,y2"`` so the existing Predict UI can render
+    something useful without a custom widget. ``probability`` carries
+    the detection score.
+    """
+    pred_boxes = getattr(outputs, "pred_boxes", None)
+    logits = getattr(outputs, "logits", None)
+    if pred_boxes is None or logits is None:
+        latency_ms = (time.time() - t0) * 1000
+        return PredictResponse(
+            predictions=[[Prediction(label=0, class_name="(no detections)",
+                                       probability=None, score=None)]],
+            model_type=model_type, latency_ms=round(latency_ms, 2),
+        )
+    # logits: (1, num_queries, num_classes+1) — argmax over classes
+    scores = torch.softmax(logits[0], dim=-1)
+    cls_scores, cls_labels = scores[..., :-1].max(dim=-1)   # drop the no-object class
+    boxes = pred_boxes[0]   # (num_queries, 4) cxcywh in [0,1]
+    # Top boxes by confidence
+    top_n = min(10, cls_scores.size(0))
+    top_v, top_i = cls_scores.topk(top_n)
+    preds: List[Prediction] = []
+    for rank in range(top_n):
+        i = int(top_i[rank].item())
+        cx, cy, w, h = (float(v.item()) for v in boxes[i])
+        x1, y1, x2, y2 = cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
+        label_id = int(cls_labels[i].item())
+        name = class_names_fn(label_id) or f"class_{label_id}"
+        preds.append(Prediction(
+            label=label_id,
+            class_name=f"{name} @ {x1:.2f},{y1:.2f},{x2:.2f},{y2:.2f}",
+            probability=round(float(top_v[rank].item()), 6),
+            score=None,
+        ))
+    latency_ms = (time.time() - t0) * 1000
+    return PredictResponse(
+        predictions=[preds],
+        model_type=model_type,
+        latency_ms=round(latency_ms, 2),
+    )
+
+
+def _depth_response(outputs, model_type: str, t0: float) -> "PredictResponse":
+    """Render depth-estimation output as a single Prediction whose
+    ``class_name`` summarizes the depth map's stats. The full map can be
+    huge, so we don't ship it back over the wire — clients that want the
+    raw tensor should call /predict via a dedicated endpoint."""
+    depth = getattr(outputs, "predicted_depth", None)
+    if depth is None:
+        latency_ms = (time.time() - t0) * 1000
+        return PredictResponse(
+            predictions=[[Prediction(label=0, class_name="(no depth output)",
+                                      probability=None, score=None)]],
+            model_type=model_type, latency_ms=round(latency_ms, 2),
+        )
+    d = depth.float()
+    summary = (
+        f"depth map {tuple(d.shape)} — "
+        f"min={float(d.min()):.3f} max={float(d.max()):.3f} "
+        f"mean={float(d.mean()):.3f}"
+    )
+    latency_ms = (time.time() - t0) * 1000
+    return PredictResponse(
+        predictions=[[Prediction(label=0, class_name=summary,
+                                  probability=None,
+                                  score=round(float(d.mean().item()), 6))]],
+        model_type=model_type,
+        latency_ms=round(latency_ms, 2),
+    )
+
+
+def _masks_response(outputs, model_type: str, t0: float) -> "PredictResponse":
+    """Render segmentation output as a summary string. The mask tensor
+    itself is too large for a JSON response — clients that need pixel
+    masks should consume the model directly."""
+    masks = (getattr(outputs, "pred_masks", None)
+             or getattr(outputs, "logits", None))
+    latency_ms = (time.time() - t0) * 1000
+    if masks is None:
+        return PredictResponse(
+            predictions=[[Prediction(label=0, class_name="(no mask output)",
+                                      probability=None, score=None)]],
+            model_type=model_type, latency_ms=round(latency_ms, 2),
+        )
+    return PredictResponse(
+        predictions=[[Prediction(label=0,
+                                  class_name=f"segmentation map {tuple(masks.shape)}",
+                                  probability=None, score=None)]],
+        model_type=model_type, latency_ms=round(latency_ms, 2),
+    )

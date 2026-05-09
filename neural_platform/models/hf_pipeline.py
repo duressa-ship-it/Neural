@@ -38,15 +38,30 @@ from neural_platform.models.base import BaseModel
 
 
 def _resolve_auto_class_name(task: Optional[str]) -> str:
-    """Pick a `transformers.Auto*` class name for the given task.
+    """Pick a `transformers.Auto*` class **name** for the given task.
 
-    Reads from :mod:`core.pipeline_specs` — the single source of truth for
-    every HF pipeline_tag NeuralForge supports. Falls back to ``AutoModel``
-    (the encoder-only base) when the task is None or unrecognized; that's
-    still useful for feature extraction and encoder-only fine-tunes.
+    Returns the *preferred* class name from the spec's fallback chain —
+    not the actual class object, and not necessarily one that exists in
+    the installed transformers. For runtime resolution use
+    :func:`_resolve_auto_class` below, which probes the chain.
     """
     from neural_platform.core.pipeline_specs import resolve
     return resolve(task).auto_class
+
+
+def _resolve_auto_class(transformers_module, task: Optional[str]):
+    """Probe transformers for the first Auto* class in the task's spec
+    chain that actually exists in the installed library.
+
+    Returns ``(class, name)``. Raises a RuntimeError listing the chain
+    when nothing resolves — that message replaces the older
+    ``module transformers has no attribute AutoModelForVision2Seq``
+    message and is what the user sees when they install a transformers
+    version that's drifted past our spec.
+    """
+    from neural_platform.core.pipeline_specs import resolve, resolve_auto_class
+    spec = resolve(task)
+    return resolve_auto_class(transformers_module, spec)
 
 
 # Backward-compat: a few external callers / tests reference this name. We
@@ -92,13 +107,16 @@ class HFPipelineModel(BaseModel):
                 "Install with: pip install transformers"
             ) from exc
 
-        auto_name = _resolve_auto_class_name(self._task)
+        # Probe the spec's fallback chain — transformers v4 → v5 renames
+        # mean a single class name (e.g. AutoModelForVision2Seq) won't
+        # always exist. resolve_auto_class returns the first Auto* class
+        # that the installed transformers actually exposes; if none do, it
+        # raises a clear error listing every name we tried.
         try:
-            auto_cls = getattr(transformers, auto_name)
-        except AttributeError as exc:
+            auto_cls, auto_name = _resolve_auto_class(transformers, self._task)
+        except RuntimeError as exc:
             raise RuntimeError(
-                f"transformers does not expose `{auto_name}` for task "
-                f"'{self._task}'. Upgrade `transformers` or pick a different task."
+                f"Could not resolve an Auto* class for task '{self._task}': {exc}"
             ) from exc
 
         # `output_size` only makes sense for classification heads. For
@@ -203,11 +221,20 @@ class HFPipelineModel(BaseModel):
           * Keyword dict (e.g. ``model(input_ids=…, attention_mask=…)`` for
             text after the loader unpacks the tokenizer dict via ``**inputs``).
 
-        Returns the model's logits (or last_hidden_state for encoder-only
-        feature-extraction tasks). Tolerates the full set of fields HF
-        tokenizers / image processors emit — anything the underlying model
-        doesn't recognize is silently dropped, so e.g. ``token_type_ids``
-        getting passed to a Whisper backbone won't blow up.
+        Returns:
+          * ``outputs.logits`` for the classification family (single
+            tensor, simple to argmax + render).
+          * ``outputs.last_hidden_state`` for feature-extraction.
+          * The **full structured output** for everything else — QA
+            (``QuestionAnsweringModelOutput.start_logits/.end_logits``),
+            object detection, segmentation, depth, etc. The server's
+            postproc path branches on ``spec.output_kind`` and reads
+            whatever fields it needs.
+
+        Tolerates the full set of fields HF tokenizers / image processors
+        emit — anything the underlying model doesn't recognize is silently
+        dropped, so e.g. ``token_type_ids`` getting passed to a Whisper
+        backbone won't blow up.
         """
         # Filter kwargs against the HF model's own forward signature.
         if kwargs:
@@ -218,6 +245,20 @@ class HFPipelineModel(BaseModel):
             outputs = self.encoder(**self._filter_kwargs(args[0]))
         else:
             outputs = self.encoder(*args)
+
+        # Structured outputs (QA, object detection, segmentation, depth)
+        # carry several tensors. If we collapse them to one we lose the
+        # ones the postprocessor needs (start_logits + end_logits for QA,
+        # pred_boxes + scores for detection). Detect by attribute presence
+        # and pass the whole object through.
+        if (hasattr(outputs, "start_logits") and hasattr(outputs, "end_logits")):
+            return outputs   # QA: postproc reads .start_logits / .end_logits
+        if hasattr(outputs, "pred_boxes"):
+            return outputs   # object detection
+        if hasattr(outputs, "predicted_depth"):
+            return outputs   # depth estimation
+        if hasattr(outputs, "logits") and hasattr(outputs, "pred_masks"):
+            return outputs   # segmentation (logits + masks)
 
         if hasattr(outputs, "logits"):
             return outputs.logits
