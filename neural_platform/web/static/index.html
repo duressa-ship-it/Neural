@@ -938,62 +938,91 @@ neural init --model transformer --name text_classifier</div>
           </div>
         </div>
 
-        <div id="pg-mlp-input">
-          <div class="text-xs text-muted mb-2">Feature values (one per cell)</div>
-          <div class="mlp-grid" id="pg-mlp-grid"></div>
-          <div class="row-tight mt-2">
-            <button class="btn btn-secondary btn-xs" onclick="pgAddMlpField(0)">+ Field</button>
-            <button class="btn btn-ghost btn-xs" onclick="pgRandomFill()">Randomize</button>
-            <button class="btn btn-ghost btn-xs" onclick="pgClearFields()">Zero</button>
+        <!--
+          Universal input panel — replaces the old pg-mlp / pg-cnn /
+          pg-rnn / pg-tx / pg-audio / pg-tabular / pg-video / pg-hf
+          panels with a single set of fields whose visibility is driven
+          by the connected model's `ui_hint` (returned by /info). The
+          server's spec table decides which fields apply per task; the
+          frontend just toggles them on/off.
+        -->
+        <div id="pg-universal">
+          <!-- Hint banner: small description rendered from spec.notes -->
+          <div id="pg-hint" class="text-xs text-muted mb-2"
+               style="padding:8px 10px;border:1px solid var(--border);border-radius:8px;background:var(--bg-soft)">
+            Connect to a server to see what input it accepts.
           </div>
-        </div>
 
-        <div id="pg-cnn-input" class="hidden">
-          <div class="drop" id="pg-drop" onclick="document.getElementById('pg-file').click()">
-            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="color:var(--fg-muted)"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
-            <div class="mt-2">Drop image here or click to browse</div>
-            <div class="text-xs text-muted mt-2">PNG, JPG, GIF — auto-resized by server</div>
-            <img id="pg-img-preview" class="hidden" alt="preview" />
+          <!-- Text / instruction / question -->
+          <div id="pg-text-row" class="field hidden">
+            <label class="label" id="pg-text-label">Text</label>
+            <input class="input" id="pg-text" placeholder="Type the input text" />
           </div>
-          <input type="file" id="pg-file" accept="image/*" class="hidden" onchange="pgHandleFile(this.files[0])" />
-        </div>
 
-        <div id="pg-rnn-input" class="hidden">
-          <label class="label">Input sequence — one timestep per line, comma-separated features</label>
-          <textarea class="input" id="pg-rnn" placeholder="0.1, 0.5, 0.9&#10;0.2, 0.4, 0.8"></textarea>
-        </div>
+          <!-- QA / text-pair context -->
+          <div id="pg-context-row" class="field hidden">
+            <label class="label">Context (passage)</label>
+            <textarea class="input" id="pg-context" placeholder="Paste the passage the question should be answered from" style="min-height:80px"></textarea>
+          </div>
 
-        <div id="pg-tx-input" class="hidden">
-          <label class="label">Text (server tokenizes), or pre-tokenized IDs</label>
-          <input class="input" id="pg-text" placeholder="the movie was great" />
-          <div class="text-xs text-muted mt-2">Or paste comma-separated token IDs:</div>
-          <input class="input input-mono mt-1" id="pg-tokens" placeholder="101, 2023, 2003, 1037, 102" />
-        </div>
+          <!-- Candidate labels (zero-shot) -->
+          <div id="pg-labels-row" class="field hidden">
+            <label class="label">Candidate labels</label>
+            <input class="input" id="pg-labels" placeholder="positive, negative, neutral" />
+            <div class="text-xs text-faint mt-1">Comma-separated. The server scores each label.</div>
+          </div>
 
-        <div id="pg-audio-input" class="hidden">
-          <label class="label">Audio waveform — comma-separated samples (raw float32)</label>
-          <textarea class="input input-mono" id="pg-audio" placeholder="0.001, 0.002, 0.0, -0.001, …" style="min-height:120px"></textarea>
-          <div class="text-xs text-muted mt-2">Server pads/truncates to (sample_rate × duration_secs). For long clips, write a client that reads the WAV directly.</div>
-        </div>
+          <!-- Universal file drop — handles image / audio / video / etc. -->
+          <div id="pg-file-row" class="hidden">
+            <div class="drop" id="pg-drop" onclick="document.getElementById('pg-file').click()">
+              <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="color:var(--fg-muted)">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                <polyline points="14 2 14 8 20 8"/>
+              </svg>
+              <div class="mt-2" id="pg-drop-label">Drop a file here, or click to browse</div>
+              <div class="text-xs text-muted mt-2" id="pg-drop-hint"></div>
+              <img id="pg-img-preview" class="hidden mt-2" alt="preview" style="max-width:240px;border-radius:6px" />
+              <div id="pg-file-info" class="text-xs hidden mt-2"
+                   style="padding:6px 8px;border-radius:6px;background:var(--bg-elev);font-family:var(--font-mono)"></div>
+            </div>
+            <input type="file" id="pg-file" class="hidden" onchange="pgHandleFile(this.files[0])" />
+          </div>
 
-        <div id="pg-tabular-input" class="hidden">
-          <label class="label">Numeric features (comma-separated)</label>
-          <input class="input input-mono" id="pg-tab-numeric" placeholder="0.1, 0.5, 0.9, 0.2" />
-          <label class="label mt-2">Categorical features (comma-separated indexes)</label>
-          <input class="input input-mono" id="pg-tab-categorical" placeholder="3, 1, 0, 2" />
-        </div>
+          <!-- Generation knobs (only shown for generative tasks) -->
+          <div id="pg-gen-row" class="hidden mt-2"
+               style="padding:8px 10px;border:1px dashed var(--border);border-radius:8px">
+            <div class="text-xs text-muted mb-2">Generation knobs (optional)</div>
+            <div class="grid grid-3" style="gap:8px">
+              <div>
+                <label class="label text-xs">max_new_tokens</label>
+                <input class="input input-mono" id="pg-gen-max" type="number" min="1" max="4096" placeholder="(model default)" />
+              </div>
+              <div>
+                <label class="label text-xs">temperature</label>
+                <input class="input input-mono" id="pg-gen-temp" type="number" step="0.05" min="0" max="2" placeholder="(model default)" />
+              </div>
+              <div style="padding-top:18px">
+                <label class="row-tight" style="cursor:pointer">
+                  <input type="checkbox" id="pg-gen-sample" />
+                  <span class="text-xs">do_sample</span>
+                </label>
+              </div>
+            </div>
+          </div>
 
-        <div id="pg-video-input" class="hidden">
-          <label class="label">Video tensor (4D nested list T,C,H,W as JSON)</label>
-          <textarea class="input input-mono" id="pg-video" placeholder="[[[[…]]],…]" style="min-height:80px"></textarea>
-          <div class="text-xs text-muted mt-2">Most users preprocess clips client-side, then paste the resulting 4D float array.</div>
-        </div>
-
-        <div id="pg-hf-input" class="hidden">
-          <label class="label">Universal HF input — pick the field that matches your model's task:</label>
-          <input class="input" id="pg-hf-text" placeholder="text — for text-classification, summarization, etc." />
-          <input class="input input-mono mt-2" id="pg-hf-audio" placeholder="audio waveform — comma-separated floats" />
-          <div class="text-xs text-muted mt-2">For images, use the image drop zone above (or switch to CNN).</div>
+          <!-- Advanced: raw JSON / waveform / token IDs (kept as an
+               escape hatch for users who prefer the legacy shape). -->
+          <details class="mt-3" id="pg-raw-details">
+            <summary class="text-xs text-muted" style="cursor:pointer">Advanced — send raw JSON or numeric arrays</summary>
+            <div class="field mt-2">
+              <label class="label text-xs">Raw `inputs` (JSON list / nested list)</label>
+              <textarea class="input input-mono" id="pg-raw-inputs" placeholder='[0.1, 0.5, 0.9]   or   [[0.1, 0.2], [0.3, 0.4]]' style="min-height:60px"></textarea>
+            </div>
+            <div class="field mt-2">
+              <label class="label text-xs">Pre-tokenized token IDs (JSON list)</label>
+              <input class="input input-mono" id="pg-raw-tokens" placeholder="[101, 2023, 2003, 1037, 102]" />
+            </div>
+          </details>
         </div>
 
         <div class="row mt-4">

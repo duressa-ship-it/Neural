@@ -2441,8 +2441,10 @@ async function pgConnect() {
     pgSetStatus('ok', 'Connected');
     document.getElementById('pg-run').disabled = false;
     pgShowInfo(info);
-    const override = document.getElementById('pg-type-override').value;
-    pgSetType(override || info.model_type || 'mlp');
+    // Drive the universal input panel from the server's spec hint.
+    // /info now carries a ui_hint dict per the connected model's task —
+    // we toggle visibility instead of switching across hardcoded panels.
+    pgApplyHint(info.ui_hint || _pgFallbackHintFor(info.model_type));
     toast('Connected to inference server', 'success');
   } catch (e) {
     pgSetStatus('err', 'Cannot reach server');
@@ -2489,49 +2491,167 @@ function pgShowInfo(info) {
   }
   document.getElementById('pg-info').innerHTML = html;
 }
-function pgSetType(type) {
-  if (!type) return;
-  pgType = type;
-  // Hide every input panel; the right one is unhidden below.
-  [
-    'mlp-input', 'cnn-input', 'rnn-input', 'tx-input',
-    'audio-input', 'tabular-input', 'video-input', 'hf-input',
-  ].forEach(id => {
-    const el = document.getElementById('pg-' + id); if (el) el.classList.add('hidden');
-  });
-  // Map each model type to the panel that knows how to collect input for it.
-  // Unknown types fall through to MLP (a safe "list of floats" default).
-  const map = {
-    mlp:         'pg-mlp-input',
-    cnn:         'pg-cnn-input',
-    rnn:         'pg-rnn-input',
-    transformer: 'pg-tx-input',
-    audio_cnn:   'pg-audio-input',
-    tcn:         'pg-rnn-input',          // TCN takes the same sequence shape as RNN
-    tabular:     'pg-tabular-input',
-    video_cnn:   'pg-video-input',
-    hf_pipeline: 'pg-hf-input',
+/**
+ * Universal input panel — driven by the connected model's `ui_hint`
+ * (returned by /info). Applies visibility + placeholders + accept type
+ * to one set of fields. The legacy `pgSetType()` per-type switch was
+ * replaced with this; `pgType` still tracks the high-level model type
+ * for compat with existing helpers (e.g. results rendering).
+ */
+function pgApplyHint(hint) {
+  hint = hint || {};
+  pgType = hint.primary_field || 'text';
+  // Persist the hint on the module so pgRun() can consult it without
+  // re-fetching /info every keystroke.
+  _pgHint = hint;
+
+  const set = (id, on) => {
+    const el = document.getElementById(id);
+    if (el) el.classList.toggle('hidden', !on);
   };
-  document.getElementById(map[type] || 'pg-mlp-input').classList.remove('hidden');
+  set('pg-text-row',    !!hint.show_text);
+  set('pg-context-row', !!hint.show_context);
+  set('pg-labels-row',  !!hint.show_candidate_labels);
+  set('pg-file-row',    !!hint.show_file);
+  set('pg-gen-row',     !!hint.show_generation_knobs);
+
+  // Update placeholders / labels.
+  const text = document.getElementById('pg-text');
+  if (text) text.placeholder = hint.text_placeholder || 'Input text';
+  const drop = document.getElementById('pg-drop-label');
+  if (drop) drop.textContent = hint.file_placeholder || 'Drop a file here';
+  const acceptHint = document.getElementById('pg-drop-hint');
+  if (acceptHint) {
+    acceptHint.textContent = hint.accept
+      ? `Accepts: ${hint.accept.replace(/\*/g, '*')}`
+      : '';
+  }
+  const fileInput = document.getElementById('pg-file');
+  if (fileInput && hint.accept) fileInput.accept = hint.accept;
+  // Hint banner above the panel — short summary of what this model accepts.
+  const banner = document.getElementById('pg-hint');
+  if (banner) {
+    banner.textContent = hint.summary || '';
+    banner.style.display = hint.summary ? '' : 'none';
+  }
+  // Reset any previously-loaded file when the panel reconfigures —
+  // wrong b64 type would otherwise leak between connections.
+  pgImageB64 = null;
+  _pgAudioB64 = null;
+  _pgVideoB64 = null;
+  _pgFileMime = null;
+  const img = document.getElementById('pg-img-preview');
+  if (img) { img.src = ''; img.classList.add('hidden'); }
+  const fileInfo = document.getElementById('pg-file-info');
+  if (fileInfo) { fileInfo.textContent = ''; fileInfo.classList.add('hidden'); }
 }
-function pgAddMlpField(val) {
-  const grid = document.getElementById('pg-mlp-grid');
-  const inp = document.createElement('input');
-  inp.type = 'number'; inp.step = 'any'; inp.value = val ?? 0; inp.placeholder = '0.0';
-  grid.appendChild(inp);
+
+/**
+ * Fallback hint for older inference servers (or non-HF model types)
+ * that don't return a ui_hint. Uses the model_type to pick a sensible
+ * default panel layout — same logic the server-side _native_ui_hint()
+ * uses, mirrored here so the UI doesn't break if /info doesn't ship
+ * the hint yet (rolling deploys, custom forks).
+ */
+function _pgFallbackHintFor(modelType) {
+  const t = modelType || 'mlp';
+  const base = {
+    show_text: false, show_context: false, show_file: false,
+    show_candidate_labels: false, show_generation_knobs: false,
+    accept: '', primary_field: 'inputs',
+    text_placeholder: 'Input value',
+    file_placeholder: 'Drop a file here',
+    summary: '',
+  };
+  if (t === 'mlp' || t === 'tabular' || t === 'tcn' || t === 'rnn') {
+    return { ...base, show_text: true, primary_field: 'inputs',
+             text_placeholder: 'Numeric features (JSON list or comma-separated)' };
+  }
+  if (t === 'cnn') return { ...base, show_file: true, accept: 'image/*',
+                             primary_field: 'image_b64',
+                             file_placeholder: 'Drop an image' };
+  if (t === 'audio_cnn') return { ...base, show_file: true, accept: 'audio/*',
+                                    primary_field: 'audio_b64',
+                                    file_placeholder: 'Drop an audio file' };
+  if (t === 'video_cnn') return { ...base, show_file: true, accept: 'video/*',
+                                    primary_field: 'video_b64',
+                                    file_placeholder: 'Drop a video file' };
+  if (t === 'transformer') return { ...base, show_text: true, primary_field: 'text',
+                                      text_placeholder: 'Type the text to classify' };
+  if (t === 'hf_pipeline') return { ...base, show_text: true, show_file: true,
+                                      accept: 'image/*,audio/*,video/*',
+                                      primary_field: 'text',
+                                      text_placeholder: 'Type input or drop a file' };
+  return { ...base, show_text: true, primary_field: 'text' };
 }
-function pgRandomFill() { document.querySelectorAll('#pg-mlp-grid input').forEach(el => el.value = (Math.random() * 2 - 1).toFixed(3)); }
-function pgClearFields() { document.querySelectorAll('#pg-mlp-grid input').forEach(el => el.value = 0); }
+
+/**
+ * Universal file handler. Detects the MIME type of the dropped/picked
+ * file and routes the base64 payload into the right *_b64 field on
+ * the request. Single drop zone, three possible destinations — image,
+ * audio, video. The server-side decoder picks the right pipeline based
+ * on the connected model's task; this function just makes sure the
+ * right field is populated.
+ */
 function pgHandleFile(file) {
-  if (!file || !file.type.startsWith('image/')) return;
+  if (!file) return;
+  const mime = file.type || '';
   const r = new FileReader();
   r.onload = e => {
-    pgImageB64 = e.target.result.split(',')[1];
-    const img = document.getElementById('pg-img-preview');
-    img.src = e.target.result; img.classList.remove('hidden');
+    const dataUrl = e.target.result;
+    const b64 = dataUrl.split(',')[1] || '';
+    // Reset all binary fields, then route by MIME family.
+    pgImageB64 = null; _pgAudioB64 = null; _pgVideoB64 = null;
+    _pgFileMime = mime;
+    if (mime.startsWith('image/')) {
+      pgImageB64 = b64;
+      const img = document.getElementById('pg-img-preview');
+      if (img) { img.src = dataUrl; img.classList.remove('hidden'); }
+    } else if (mime.startsWith('audio/')) {
+      _pgAudioB64 = b64;
+    } else if (mime.startsWith('video/')) {
+      _pgVideoB64 = b64;
+    } else {
+      // Unknown MIME — best-effort guess by file extension.
+      const ext = (file.name.split('.').pop() || '').toLowerCase();
+      const audioExts = ['wav', 'flac', 'mp3', 'ogg', 'm4a', 'opus'];
+      const videoExts = ['mp4', 'mov', 'avi', 'mkv', 'webm'];
+      const imageExts = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'];
+      if (audioExts.includes(ext))      _pgAudioB64 = b64;
+      else if (videoExts.includes(ext)) _pgVideoB64 = b64;
+      else if (imageExts.includes(ext)) {
+        pgImageB64 = b64;
+        const img = document.getElementById('pg-img-preview');
+        if (img) { img.src = dataUrl; img.classList.remove('hidden'); }
+      } else {
+        toast(`Unrecognized file type "${ext}". Sending as raw image_b64.`, 'warn', 4000);
+        pgImageB64 = b64;
+      }
+    }
+    // Surface what was loaded — file size + type, so users see something
+    // happened. Important for audio/video where there's no preview.
+    const info = document.getElementById('pg-file-info');
+    if (info) {
+      const kb = (file.size / 1024).toFixed(1);
+      info.textContent = `${file.name} · ${mime || ext || '?'} · ${kb} KB`;
+      info.classList.remove('hidden');
+    }
   };
   r.readAsDataURL(file);
 }
+
+// Module-level state for the universal input panel.
+let _pgHint     = null;   // last hint object applied (drives pgRun's payload assembly)
+let _pgAudioB64 = null;   // base64 of a dropped audio file
+let _pgVideoB64 = null;   // base64 of a dropped video file
+let _pgFileMime = null;   // MIME hint forwarded with the b64 field
+
+// Legacy MLP grid helpers — kept as no-ops so any cached HTML calling
+// them doesn't throw. The new universal panel doesn't render the grid.
+function pgSetType(type) { /* noop — see pgApplyHint */ }
+function pgAddMlpField(val) { /* noop */ }
+function pgRandomFill()    { /* noop */ }
+function pgClearFields()   { /* noop */ }
 async function pgRun() {
   const url = document.getElementById('pg-url').value.trim();
   const topk = parseInt(document.getElementById('pg-topk').value);
@@ -2541,93 +2661,76 @@ async function pgRun() {
   btn.disabled = true;
   btn.innerHTML = '<span class="spin"></span> Running…';
 
+  const hint = _pgHint || {};
   const payload = { server_url: url, top_k: topk, return_probabilities: true };
   try {
-    if (pgType === 'cnn') {
-      if (!pgImageB64) throw new Error('Please select an image first');
-      payload.image_b64 = pgImageB64;
-    } else if (pgType === 'transformer') {
-      // Prefer raw text (server tokenizes) — fall back to pre-tokenized IDs.
-      const text = document.getElementById('pg-text')?.value.trim() || '';
-      const tokens = document.getElementById('pg-tokens')?.value.trim() || '';
-      if (text) {
-        payload.text = text;
-      } else if (tokens) {
-        const arr = tokens.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
-        if (!arr.length) throw new Error('No valid token IDs found');
-        payload.tokens = arr;
-      } else {
-        throw new Error('Enter text or pre-tokenized IDs.');
-      }
-    } else if (pgType === 'rnn' || pgType === 'tcn') {
-      const raw = document.getElementById('pg-rnn').value.trim();
-      if (!raw) throw new Error('Enter sequence data — one timestep per line.');
-      const rows = raw.split('\n').map(r => r.trim()).filter(Boolean);
-      const parsed = rows.map(r => {
-        const vals = r.split(',').map(v => parseFloat(v.trim())).filter(v => !isNaN(v));
-        return vals.length === 1 ? vals[0] : vals;
-      });
-      // Reject the case the user just hit on: rows that parse to empty
-      // arrays make the server's PredictRequest validator reject the whole
-      // payload with a confusing "Input should be a valid number" error.
-      const empty = parsed.filter(r => Array.isArray(r) && !r.length);
-      if (empty.length) {
-        throw new Error(
-          `${empty.length} row(s) had no valid numbers. Use comma-separated `
-          + `floats per line, e.g. "0.1, 0.5, 0.9".`,
-        );
-      }
-      payload.inputs = parsed;
-    } else if (pgType === 'audio_cnn') {
-      const raw = document.getElementById('pg-audio').value.trim();
-      if (!raw) throw new Error('Paste waveform samples (comma-separated floats).');
-      const arr = raw.split(/[\s,]+/).map(parseFloat).filter(v => !isNaN(v));
-      if (!arr.length) throw new Error('No valid audio samples parsed.');
-      payload.inputs = arr;
-    } else if (pgType === 'tabular') {
-      const num = document.getElementById('pg-tab-numeric').value.trim();
-      const cat = document.getElementById('pg-tab-categorical').value.trim();
-      const numArr = num ? num.split(',').map(parseFloat).filter(v => !isNaN(v)) : [];
-      const catArr = cat ? cat.split(',').map(parseInt).filter(v => !isNaN(v))   : [];
-      if (!numArr.length && !catArr.length) {
-        throw new Error('Enter at least one numeric or categorical feature.');
-      }
-      payload.inputs = { numeric: numArr, categorical: catArr };
-    } else if (pgType === 'video_cnn') {
-      const raw = document.getElementById('pg-video').value.trim();
-      if (!raw) throw new Error('Paste a 4D nested list (JSON) for the video tensor.');
-      try {
-        payload.inputs = JSON.parse(raw);
-      } catch (e) {
-        throw new Error('Video tensor must be valid JSON (4D nested list).');
-      }
-    } else if (pgType === 'hf_pipeline') {
-      const text = document.getElementById('pg-hf-text').value.trim();
-      const audio = document.getElementById('pg-hf-audio').value.trim();
-      if (text) {
-        payload.text = text;
-      } else if (audio) {
-        const arr = audio.split(/[\s,]+/).map(parseFloat).filter(v => !isNaN(v));
-        if (!arr.length) throw new Error('No valid audio samples parsed.');
+    // Universal payload assembly — read whatever the visible fields hold
+    // and pack them into the request shape the server already understands.
+    // Server-side spec dispatch + decoders pick the right path. This is
+    // the same code regardless of whether the model is text / image /
+    // audio / video / multimodal.
+    const text = document.getElementById('pg-text')?.value.trim() || '';
+    const context = document.getElementById('pg-context')?.value.trim() || '';
+    const labels = document.getElementById('pg-labels')?.value.trim() || '';
+    if (text)     payload.text = text;
+    if (context)  payload.context = context;
+    if (labels) {
+      const arr = labels.split(',').map(s => s.trim()).filter(Boolean);
+      if (arr.length) payload.candidate_labels = arr;
+    }
+    if (pgImageB64)   payload.image_b64 = pgImageB64;
+    if (_pgAudioB64)  payload.audio_b64 = _pgAudioB64;
+    if (_pgVideoB64)  payload.video_b64 = _pgVideoB64;
+    if (_pgFileMime)  payload.file_mime = _pgFileMime;
+
+    // Generation knobs (only meaningful for tasks where show_generation_knobs
+    // is true; we still let users send them even when hidden — the server
+    // ignores extras for non-generative tasks).
+    const gMax  = parseInt(document.getElementById('pg-gen-max')?.value);
+    const gTemp = parseFloat(document.getElementById('pg-gen-temp')?.value);
+    const gSamp = document.getElementById('pg-gen-sample')?.checked;
+    if (!isNaN(gMax))  payload.max_new_tokens = gMax;
+    if (!isNaN(gTemp)) payload.temperature = gTemp;
+    if (gSamp != null) payload.do_sample = !!gSamp;
+
+    // Advanced escape hatch — raw `inputs` and pre-tokenized `tokens`.
+    // These take precedence over the universal fields when populated,
+    // for users who need exact control (RNN sequences, MLP feature
+    // vectors, pre-tokenized text).
+    const rawInputs = document.getElementById('pg-raw-inputs')?.value.trim();
+    const rawTokens = document.getElementById('pg-raw-tokens')?.value.trim();
+    if (rawInputs) {
+      try { payload.inputs = JSON.parse(rawInputs); }
+      catch (_) {
+        // Tolerate comma-separated floats as a convenience.
+        const arr = rawInputs.split(/[\s,]+/).map(parseFloat).filter(v => !isNaN(v));
+        if (!arr.length) throw new Error('Raw `inputs` must be valid JSON or a comma-separated list of numbers.');
         payload.inputs = arr;
-      } else if (pgImageB64) {
-        payload.image_b64 = pgImageB64;
-      } else {
-        throw new Error("Pick one input: text, audio waveform, or upload an image.");
       }
-    } else {
-      // MLP / fallback: collect numbers from the grid. Reject if nothing was
-      // typed — empty list goes to /predict and surfaces the cryptic "Input
-      // should be a valid number" error.
-      const cells = [...document.querySelectorAll('#pg-mlp-grid input')];
-      if (!cells.length) {
-        throw new Error("No input fields rendered. Try clicking + Field above.");
+    }
+    if (rawTokens) {
+      try { payload.tokens = JSON.parse(rawTokens); }
+      catch (_) {
+        const arr = rawTokens.split(/[\s,]+/).map(s => parseInt(s)).filter(n => !isNaN(n));
+        if (!arr.length) throw new Error('Pre-tokenized IDs must be valid JSON or a comma-separated list of integers.');
+        payload.tokens = arr;
       }
-      const arr = cells.map(el => {
-        const v = parseFloat(el.value);
-        return isNaN(v) ? 0 : v;
-      });
-      payload.inputs = arr;
+    }
+
+    // Sanity: make sure we actually have something to send. The hint
+    // tells us the primary field; complain if it's missing AND no
+    // fallback fields were supplied.
+    const hasContent = !!(payload.text || payload.image_b64
+        || payload.audio_b64 || payload.video_b64
+        || payload.inputs !== undefined || payload.tokens
+        || payload.candidate_labels);
+    if (!hasContent) {
+      const need = hint.primary_field || 'an input';
+      const human = {
+        text: 'text', image_b64: 'an image', audio_b64: 'an audio file',
+        video_b64: 'a video file', inputs: 'raw inputs',
+      }[need] || need;
+      throw new Error(`Provide ${human} before running.`);
     }
 
     pgLastReq = { ...payload };
@@ -2751,10 +2854,20 @@ function pgClearResults() {
   document.getElementById('pg-json').classList.add('hidden');
   document.getElementById('pg-error').classList.add('hidden');
   document.getElementById('pg-latency').textContent = '';
-  pgImageB64 = null; pgLastReq = pgLastRes = null;
-  const img = document.getElementById('pg-img-preview'); if (img) { img.src = ''; img.classList.add('hidden'); }
-  const t = document.getElementById('pg-text'); if (t) t.value = '';
-  const r = document.getElementById('pg-rnn'); if (r) r.value = '';
+  // Clear universal-input state — text + context + labels + every b64 field.
+  pgImageB64 = null; _pgAudioB64 = null; _pgVideoB64 = null;
+  _pgFileMime = null; pgLastReq = pgLastRes = null;
+  const img = document.getElementById('pg-img-preview');
+  if (img) { img.src = ''; img.classList.add('hidden'); }
+  const fileInfo = document.getElementById('pg-file-info');
+  if (fileInfo) { fileInfo.textContent = ''; fileInfo.classList.add('hidden'); }
+  ['pg-text', 'pg-context', 'pg-labels',
+   'pg-gen-max', 'pg-gen-temp',
+   'pg-raw-inputs', 'pg-raw-tokens'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.value = '';
+  });
+  const samp = document.getElementById('pg-gen-sample');
+  if (samp) samp.checked = false;
 }
 function initPredictLatencyChart() {
   destroyChart('pg-lat-chart');

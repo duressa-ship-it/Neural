@@ -71,6 +71,33 @@ class PredictRequest(PydanticModel):
     image_b64: Optional[str] = Field(
         None, description="Base64-encoded image bytes (PNG/JPG/GIF) for CNN models"
     )
+    audio_b64: Optional[str] = Field(
+        None,
+        description=(
+            "Base64-encoded audio file (WAV/FLAC/MP3/OGG/M4A). The server "
+            "decodes it to a float32 mono waveform and resamples to the "
+            "model's expected rate (Whisper: 16 kHz). Use instead of the "
+            "raw `inputs` waveform when sending real audio files from the UI."
+        ),
+    )
+    video_b64: Optional[str] = Field(
+        None,
+        description=(
+            "Base64-encoded video file (MP4/AVI/MOV). The server decodes it "
+            "to a frame tensor at the model's expected resolution. Falls "
+            "back to a frame-extraction error if torchvision/av aren't "
+            "available."
+        ),
+    )
+    file_mime: Optional[str] = Field(
+        None,
+        description=(
+            "Optional MIME hint for any of the *_b64 fields. Used to pick "
+            "the right decoder when the file extension is ambiguous (e.g. "
+            "raw audio vs. video container). The server will still sniff "
+            "magic bytes when this is missing."
+        ),
+    )
     text: Optional[str] = Field(
         None, description="Raw text — server tokenizes via HuggingFace AutoTokenizer"
     )
@@ -186,6 +213,17 @@ class InfoResponse(PydanticModel):
     hf_model_id:      Optional[str] = None
     auto_class:       Optional[str] = None
     processor_class:  Optional[str] = None
+    # UI hint dictionary derived from the pipeline_specs table — the
+    # Predict tab reads this off /info and renders a single universal
+    # input panel whose visible fields adapt to the connected model.
+    ui_hint:          Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "Hint object describing which input fields the universal "
+            "Predict panel should expose for this model. Schema is stable "
+            "across releases — see core.pipeline_specs.ui_hint."
+        ),
+    )
 
 
 class LayersResponse(PydanticModel):
@@ -444,16 +482,23 @@ def create_inference_app(config: ExperimentConfig,
                   if config.model.hf_pipeline else None)
         auto_class = None
         processor_class = None
+        ui_hint_dict = None
         if config.model.type.value == "hf_pipeline":
             try:
                 from neural_platform.core.pipeline_specs import (
-                    resolve as _resolve_spec, PROCESSOR_AUTO_CLASS,
+                    resolve as _resolve_spec, PROCESSOR_AUTO_CLASS, ui_hint,
                 )
                 spec = _resolve_spec(pipeline_task)
                 auto_class = spec.auto_class
                 processor_class = PROCESSOR_AUTO_CLASS.get(spec.processor_kind)
+                ui_hint_dict = ui_hint(spec)
             except Exception:
                 pass
+        else:
+            # Native model types (mlp/cnn/rnn/audio_cnn/…) — emit a sensible
+            # default UI hint so the same universal panel renders for them.
+            mtype = config.model.type.value
+            ui_hint_dict = _native_ui_hint(mtype)
 
         # If the HF model carries id2label, surface it as class_names so the
         # Predict UI shows real labels instead of bare ids. Honor any class
@@ -485,6 +530,7 @@ def create_inference_app(config: ExperimentConfig,
             hf_model_id=hf_id,
             auto_class=auto_class,
             processor_class=processor_class,
+            ui_hint=ui_hint_dict,
         )
 
     @app.get("/info/layers", response_model=LayersResponse, tags=["System"], summary="Per-layer breakdown")
@@ -1143,7 +1189,14 @@ def _build_hf_pipeline_input(request: PredictRequest, config: ExperimentConfig,
             proc_kwargs["images"] = Image.open(
                 io.BytesIO(base64.b64decode(request.image_b64))
             ).convert("RGB")
-        if request.inputs is not None:
+        if request.audio_b64 is not None:
+            target_sr = _resolve_target_sample_rate(processor)
+            proc_kwargs["audio"] = _decode_audio_b64(
+                request.audio_b64, target_sr=target_sr,
+                file_mime=request.file_mime,
+            )
+            proc_kwargs.setdefault("sampling_rate", target_sr)
+        elif request.inputs is not None:
             # Treat numeric `inputs` as raw audio waveform — most common
             # any-to-any audio path.
             wav = request.inputs
@@ -1241,19 +1294,32 @@ def _build_hf_pipeline_input(request: PredictRequest, config: ExperimentConfig,
 
     # ----- audio family --------------------------------------------------
     if kind in (INPUT_AUDIO, INPUT_AUDIO_TEXT):
-        if request.inputs is None:
-            raise _InputError(
-                f"Task '{spec.task}' needs 'inputs' as a list of waveform samples "
-                "(default sample rate 16000)."
+        # Accept three input shapes for universal-input UX:
+        #   1. audio_b64 — a base64-encoded audio file (WAV/FLAC/MP3/…).
+        #      The Predict tab's universal file drop produces this.
+        #   2. inputs    — a flat list of float32 waveform samples.
+        #   3. inputs    — nested 2D, in which case we take the first row.
+        target_sr = _resolve_target_sample_rate(processor)
+        if request.audio_b64 is not None:
+            wav = _decode_audio_b64(
+                request.audio_b64,
+                target_sr=target_sr,
+                file_mime=request.file_mime,
             )
-        data = request.inputs
-        # Flatten to a 1D float waveform — feature extractors expect that.
-        if isinstance(data, list) and data and isinstance(data[0], (int, float)):
-            wav = [float(x) for x in data]
-        elif isinstance(data, list) and data and isinstance(data[0], (list, tuple)):
-            wav = [float(x) for x in data[0]]   # take first sample if 2D was sent
+        elif request.inputs is not None:
+            data = request.inputs
+            if isinstance(data, list) and data and isinstance(data[0], (int, float)):
+                wav = [float(x) for x in data]
+            elif isinstance(data, list) and data and isinstance(data[0], (list, tuple)):
+                wav = [float(x) for x in data[0]]   # take first sample if 2D was sent
+            else:
+                wav = list(data)
         else:
-            wav = list(data)
+            raise _InputError(
+                f"Task '{spec.task}' needs an audio waveform. Send `audio_b64` "
+                "(base64-encoded WAV/FLAC/MP3) or `inputs` (a flat list of float "
+                f"samples at {target_sr} Hz)."
+            )
 
         # If we have a feature extractor / processor, run it. ASR + audio
         # classification with HF processors expect mel-spectrograms, not
@@ -1285,9 +1351,18 @@ def _build_hf_pipeline_input(request: PredictRequest, config: ExperimentConfig,
 
     # ----- video, fallback ----------------------------------------------
     if kind == INPUT_VIDEO:
+        # Universal input: accept either a real video file via
+        # `video_b64` or the legacy 4D nested-list `inputs` shape.
+        if request.video_b64 is not None:
+            frames = _decode_video_b64(
+                request.video_b64, file_mime=request.file_mime,
+            )
+            # frames: (T, C, H, W) → (1, T, C, H, W) batched.
+            return frames.unsqueeze(0).to(device)
         if request.inputs is None:
             raise _InputError(
-                f"Task '{spec.task}' needs 'inputs' as a 4D nested list (T, C, H, W)."
+                f"Task '{spec.task}' needs a video. Send `video_b64` (base64-"
+                "encoded MP4/MOV) or `inputs` (a 4D nested list (T, C, H, W))."
             )
         t = torch.tensor(request.inputs, dtype=torch.float32)
         if t.dim() == 4:
@@ -1379,6 +1454,225 @@ def _lookup_class(class_names: Optional[List[str]], idx: int) -> Optional[str]:
     if 0 <= idx < len(class_names):
         return class_names[idx]
     return None
+
+
+# ---------------------------------------------------------------------------
+# Binary file decoders (used by the universal predict input)
+# ---------------------------------------------------------------------------
+# The Predict UI sends one universal request shape (text + context +
+# image_b64 + audio_b64 + video_b64). The decoders below turn those
+# base64 blobs into the tensors / arrays the model's processor needs.
+# Centralizing decode here keeps the input adapter thin and lets us
+# share the audio resampling logic between INPUT_AUDIO and INPUT_ANY
+# without duplication.
+
+def _native_ui_hint(model_type: str) -> Dict[str, Any]:
+    """UI hint for native (non-HF) model types.
+
+    The Predict tab's universal panel reads this off /info just like the
+    HF-pipeline hint, so users see a consistent layout whether they're
+    serving a from-scratch CNN or a Hub-pulled Whisper. Each branch picks
+    the right primary field + file accept type.
+    """
+    base: Dict[str, Any] = {
+        "show_text":             True,
+        "show_context":          False,
+        "show_file":             False,
+        "show_candidate_labels": False,
+        "show_generation_knobs": False,
+        "accept":                "",
+        "text_placeholder":      "Input value",
+        "file_placeholder":      "Drop a file here",
+        "primary_field":         "text",
+        "summary":               f"Model type: {model_type}",
+    }
+    if model_type == "mlp":
+        base.update(
+            show_text=False, show_file=False,
+            primary_field="inputs",
+            summary="Send a flat list of float features in `inputs`.",
+        )
+    elif model_type in ("cnn", "video_cnn"):
+        base.update(
+            show_text=False, show_file=True,
+            accept="image/*" if model_type == "cnn" else "video/*",
+            file_placeholder=("Drop an image" if model_type == "cnn"
+                               else "Drop a video file"),
+            primary_field="image_b64" if model_type == "cnn" else "video_b64",
+        )
+    elif model_type == "audio_cnn":
+        base.update(
+            show_text=False, show_file=True, accept="audio/*",
+            file_placeholder="Drop an audio file",
+            primary_field="audio_b64",
+        )
+    elif model_type == "rnn":
+        base.update(
+            show_text=True, primary_field="inputs",
+            text_placeholder="Sequence — JSON 2D list, or comma-separated rows",
+        )
+    elif model_type == "transformer":
+        base.update(
+            text_placeholder="Type the text to classify / continue",
+        )
+    elif model_type in ("tcn", "tabular"):
+        base.update(
+            text_placeholder="Numeric features (JSON list or comma-separated)",
+            primary_field="inputs",
+        )
+    return base
+
+
+def _resolve_target_sample_rate(processor) -> int:
+    """Pick the sample rate the loaded HF audio processor expects.
+
+    Whisper / Wav2Vec2 / HuBERT all want 16 kHz; some music models want
+    44.1 kHz. We read the processor's own ``sampling_rate`` attribute
+    (works for both FeatureExtractor and the unified Processor that
+    wraps one), and fall back to 16000 — the right answer for ~95% of
+    HF audio models.
+    """
+    for src in (processor, getattr(processor, "feature_extractor", None)):
+        if src is None:
+            continue
+        sr = getattr(src, "sampling_rate", None)
+        if sr:
+            try:
+                return int(sr)
+            except Exception:
+                pass
+    return 16000
+
+
+def _decode_audio_b64(b64: str, *, target_sr: int = 16000,
+                       file_mime: Optional[str] = None) -> "list[float]":
+    """Decode a base64-encoded audio file to a mono float32 waveform.
+
+    Tries soundfile first (covers WAV/FLAC/OGG natively), falls back to
+    librosa (handles MP3/M4A via audioread/ffmpeg). Mono-mixes stereo and
+    resamples to ``target_sr`` (the rate the loaded HF feature extractor
+    expects — Whisper / Wav2Vec2 want 16 kHz).
+
+    Returns a plain Python list of floats so it slots into the existing
+    ``request.inputs`` path with no further conversion. Raises
+    :class:`_InputError` with an actionable message when the file can't
+    be decoded — keeps the Predict UI's error pane meaningful.
+    """
+    import base64
+    import io
+    try:
+        raw = base64.b64decode(b64, validate=False)
+    except Exception as exc:
+        raise _InputError(f"Couldn't base64-decode audio_b64: {exc}")
+
+    # Path 1: soundfile (no external dependencies; covers WAV/FLAC/OGG).
+    try:
+        import soundfile as sf
+        import numpy as np
+        wav, sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=False)
+        if hasattr(wav, "ndim") and wav.ndim > 1:
+            wav = wav.mean(axis=1)   # stereo → mono
+        # Resample if needed. Prefer librosa (high quality) when present;
+        # otherwise fall back to a simple linear interp via numpy.
+        if sr != target_sr:
+            try:
+                import librosa
+                wav = librosa.resample(wav, orig_sr=sr, target_sr=target_sr)
+            except ImportError:
+                # Linear interp — adequate for short ASR clips, far from
+                # ideal for production audio. The librosa path is always
+                # preferred when available.
+                ratio = target_sr / sr
+                new_len = int(round(len(wav) * ratio))
+                xs_old = np.linspace(0, 1, len(wav), endpoint=False)
+                xs_new = np.linspace(0, 1, new_len, endpoint=False)
+                wav = np.interp(xs_new, xs_old, wav)
+        return [float(x) for x in wav]
+    except _InputError:
+        raise
+    except Exception:
+        # Path 2: librosa (handles MP3/M4A via audioread/ffmpeg). librosa
+        # is in the [audio] extra; if it's not installed, surface a clear
+        # missing-dep error instead of an opaque traceback.
+        try:
+            import librosa
+            wav, _ = librosa.load(io.BytesIO(raw), sr=target_sr, mono=True)
+            return [float(x) for x in wav]
+        except ImportError as exc:
+            raise _InputError(
+                f"Couldn't decode the audio file ({file_mime or 'unknown mime'}). "
+                "Install the audio extra (`pip install -e .[audio]`) so soundfile "
+                "and librosa are available, or send a raw waveform via the "
+                "`inputs` field instead."
+            ) from exc
+        except Exception as exc:
+            raise _InputError(
+                f"Could not decode audio file ({file_mime or 'unknown'}): {exc}. "
+                "Try a different format (WAV/FLAC are the most reliable)."
+            ) from exc
+
+
+def _decode_video_b64(b64: str, *, file_mime: Optional[str] = None,
+                       num_frames: int = 16,
+                       target_size: tuple = (224, 224)) -> "torch.Tensor":
+    """Decode a base64-encoded video file to a (T, C, H, W) float tensor.
+
+    Uses torchvision.io.read_video when available (handles MP4/MOV/AVI
+    via ffmpeg). Uniformly samples ``num_frames`` frames across the clip
+    and resizes them to ``target_size``. Returns a tensor in [0, 1] float
+    space.
+
+    The `[video]` extra installs torchvision + av. Without that, a clear
+    install hint surfaces instead of an opaque traceback.
+    """
+    import base64
+    import io
+    import tempfile
+    try:
+        raw = base64.b64decode(b64, validate=False)
+    except Exception as exc:
+        raise _InputError(f"Couldn't base64-decode video_b64: {exc}")
+
+    try:
+        from torchvision.io import read_video
+        from torchvision import transforms as T
+    except ImportError as exc:
+        raise _InputError(
+            "Video decoding needs torchvision (and ffmpeg). Install with "
+            "`pip install -e .[video]`."
+        ) from exc
+
+    # torchvision.io.read_video accepts a path, not bytes — write to a
+    # temp file. Cleaned up on context exit.
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=True) as f:
+        f.write(raw)
+        f.flush()
+        try:
+            frames, _audio, _info = read_video(f.name, pts_unit="sec")
+        except Exception as exc:
+            raise _InputError(
+                f"Could not decode video file ({file_mime or 'unknown'}): {exc}. "
+                "MP4 is the most reliable format. Make sure ffmpeg is installed."
+            ) from exc
+
+    # frames: (T, H, W, C) uint8. Subsample uniformly to num_frames.
+    if frames.shape[0] == 0:
+        raise _InputError("Video decoded to zero frames — the file may be corrupt.")
+    if frames.shape[0] > num_frames:
+        idx = torch.linspace(0, frames.shape[0] - 1, num_frames).long()
+        frames = frames[idx]
+    elif frames.shape[0] < num_frames:
+        # Pad by repeating the last frame. Better than dropping the
+        # request — short clips become longest-clip * num_frames.
+        last = frames[-1:].expand(num_frames - frames.shape[0], -1, -1, -1)
+        frames = torch.cat([frames, last], dim=0)
+
+    # (T, H, W, C) → (T, C, H, W) and float in [0, 1]
+    frames = frames.permute(0, 3, 1, 2).float() / 255.0
+    # Resize each frame to the target HxW.
+    resize = T.Resize(target_size, antialias=True)
+    frames = torch.stack([resize(f) for f in frames])
+    return frames
 
 
 # ---------------------------------------------------------------------------

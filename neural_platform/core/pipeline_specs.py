@@ -554,3 +554,134 @@ PROCESSOR_AUTO_CLASS: Dict[str, str] = {
     PROCESSOR_FEATURE_EXTRACTOR: "AutoFeatureExtractor",
     PROCESSOR_PROCESSOR:         "AutoProcessor",
 }
+
+
+# ---------------------------------------------------------------------------
+# UI hints — drive the universal Predict input panel
+# ---------------------------------------------------------------------------
+# The dashboard's Predict tab used to show different input panels per
+# model_type (MLP grid vs. CNN drop vs. RNN textarea vs. ASR waveform
+# textarea). The new universal input replaces that with one set of
+# fields whose visibility is driven by these hints — so a single panel
+# adapts to whichever HF task the connected server is actually running.
+
+# What the universal Predict panel should show / accept for this task.
+# Consumers (web/static/app.js) read this off /info and toggle visibility
+# without having to mirror the spec table on the JS side.
+
+def ui_hint(spec: PipelineSpec) -> Dict[str, Any]:
+    """Render a UI hint dict for the universal Predict panel.
+
+    Output schema (stable — `app.js` parses this directly):
+
+      {
+        "show_text":         bool,    // text/instruction box
+        "show_context":      bool,    // QA passage
+        "show_file":         bool,    // generic file drop
+        "show_candidate_labels": bool, // zero-shot helper
+        "show_generation_knobs": bool, // max_new_tokens / temperature
+        "accept":            str,     // <input type=file accept="…">
+        "text_placeholder":  str,
+        "file_placeholder":  str,
+        "primary_field":     str,     // which field is the *main* one
+        "summary":           str,     // human description shown above the panel
+      }
+
+    The defaults below are tuned so a brand-new pipeline_tag we don't
+    have a spec for still produces a usable UI (text + file drop, accept
+    everything). Each branch overrides only the fields that differ.
+    """
+    h: Dict[str, Any] = {
+        "show_text":             True,
+        "show_context":          False,
+        "show_file":             False,
+        "show_candidate_labels": False,
+        "show_generation_knobs": spec.needs_generation,
+        "accept":                "",
+        "text_placeholder":      "Input text…",
+        "file_placeholder":      "Drop a file here, or click to browse",
+        "primary_field":         "text",
+        "summary":               spec.notes or f"Task: {spec.task}",
+    }
+
+    kind = spec.input_kind
+
+    if kind == INPUT_TEXT:
+        h["text_placeholder"] = "Type the text the model should process"
+    elif kind == INPUT_TEXT_PAIR:
+        # QA: question + context.
+        h["show_context"] = True
+        h["text_placeholder"] = "Question"
+        h["summary"] = (
+            "Send a question in the text field plus a passage in the "
+            "context field. The server returns the answer span."
+        )
+        h["primary_field"] = "text"
+    elif kind == INPUT_TEXT_LABELS:
+        h["show_candidate_labels"] = True
+        h["text_placeholder"] = "Text to classify"
+        h["summary"] = "Send text + candidate labels. The server scores each label."
+    elif kind == INPUT_IMAGE:
+        h["show_file"] = True
+        h["accept"] = "image/*"
+        h["show_text"] = False
+        h["file_placeholder"] = "Drop an image (PNG / JPG / WEBP)"
+        h["primary_field"] = "image_b64"
+        h["summary"] = (
+            "Send an image. The server runs the model's image processor "
+            "(correct mean/std/resize) and returns predictions."
+        )
+    elif kind == INPUT_IMAGE_TEXT:
+        h["show_file"] = True
+        h["accept"] = "image/*"
+        h["text_placeholder"] = "Question or instruction"
+        h["file_placeholder"] = "Drop an image"
+        h["primary_field"] = "image_b64"
+        h["summary"] = (
+            "Multimodal: drop an image plus a text question or instruction."
+        )
+    elif kind == INPUT_IMAGE_LABELS:
+        h["show_file"] = True
+        h["show_candidate_labels"] = True
+        h["accept"] = "image/*"
+        h["show_text"] = False
+        h["file_placeholder"] = "Drop an image"
+        h["summary"] = (
+            "Zero-shot image classification — drop an image and list "
+            "candidate labels (one per line)."
+        )
+    elif kind == INPUT_AUDIO:
+        h["show_file"] = True
+        h["accept"] = "audio/*"
+        h["show_text"] = False
+        h["file_placeholder"] = "Drop an audio file (WAV / FLAC / MP3)"
+        h["primary_field"] = "audio_b64"
+        h["summary"] = (
+            "Drop an audio file. The server decodes it, resamples to the "
+            "model's expected rate, and runs inference."
+        )
+    elif kind == INPUT_AUDIO_TEXT:
+        h["show_file"] = True
+        h["accept"] = "audio/*"
+        h["text_placeholder"] = "Optional prompt / instruction"
+        h["file_placeholder"] = "Drop an audio file"
+        h["primary_field"] = "audio_b64"
+    elif kind == INPUT_VIDEO:
+        h["show_file"] = True
+        h["accept"] = "video/*"
+        h["show_text"] = False
+        h["file_placeholder"] = "Drop a video file (MP4 / MOV)"
+        h["primary_field"] = "video_b64"
+    elif kind == INPUT_ANY:
+        # Universal multimodal — accept anything, hint says so.
+        h["show_file"] = True
+        h["show_context"] = False
+        h["accept"] = "image/*,audio/*,video/*"
+        h["text_placeholder"] = "Type a prompt or question"
+        h["file_placeholder"] = "Drop an image, audio, or video file (optional)"
+        h["summary"] = (
+            "Any-to-any: send any combination of text, image, audio, or "
+            "video. The server's processor routes by what's present."
+        )
+
+    return h
