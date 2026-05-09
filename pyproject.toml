@@ -81,7 +81,7 @@ hf = [
 peft = ["peft>=0.7.0"]
 
 # Image-modality extras
-vision = ["torchvision>=0.15.0"]
+vision = ["torchvision>=0.15.0", "timm>=1.0.27"]
 
 # Audio-modality extras (waveform decoding for HF datasets, mel-spectrograms,
 # torchcodec for newer datasets that ship Audio cells as torchcodec decoders)

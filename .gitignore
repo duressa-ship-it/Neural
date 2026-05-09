@@ -39,3 +39,6 @@ runs/
 
 # OS 
 .DS_Store
+
+# Extra
+misc/
