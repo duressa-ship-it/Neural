@@ -688,6 +688,10 @@ def _normalize_predict_response(raw: Any) -> Dict[str, Any]:
 
     out["model_type"] = raw.get("model_type")
     out["latency_ms"] = raw.get("latency_ms")
+    # Forward result_kind so the Predict UI can pick the right renderer
+    # (boxes vs depth vs masks vs token_spans vs default top-K bars).
+    # Defaults to "logits" for back-compat with older inference servers.
+    out["result_kind"] = raw.get("result_kind", "logits")
 
     preds = raw.get("predictions")
     if isinstance(preds, list) and preds:
@@ -730,6 +734,10 @@ def _normalize_one_prediction(p: Dict[str, Any]) -> Dict[str, Any]:
         "class_name":  p.get("class_name"),
         "probability": float(prob) if prob is not None else None,
         "score":       float(p["score"]) if p.get("score") is not None else None,
+        # Pass structured-output details (bbox / qa span indices / depth
+        # PNG / token offsets) through unchanged so the renderer can
+        # dispatch on result_kind.
+        "metadata":    p.get("metadata"),
     }
 
 

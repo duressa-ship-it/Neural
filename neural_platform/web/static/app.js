@@ -2808,16 +2808,43 @@ function _pgFormatError(e) {
   return raw;
 }
 function pgRenderResults(res) {
-  const empty = document.getElementById('pg-empty');
-  const bars = document.getElementById('pg-bars');
+  // Reset all renderer panes; the dispatch below re-shows whichever
+  // ones are relevant for this result_kind.
+  const empty   = document.getElementById('pg-empty');
+  const bars    = document.getElementById('pg-bars');
+  const richImg = document.getElementById('pg-rich-image');
+  const richTxt = document.getElementById('pg-rich-text');
+  const richSpn = document.getElementById('pg-rich-spans');
+  [bars, richImg, richTxt, richSpn].forEach(el => {
+    if (el) { el.classList.add('hidden'); el.innerHTML = ''; }
+  });
+
   const preds = res.predictions || [];
   if (!preds.length) {
     empty.classList.remove('hidden');
     empty.innerHTML = `<div class="empty-icon">⚠️</div><div>No predictions returned — toggle JSON to inspect.</div>`;
-    bars.classList.add('hidden');
     return;
   }
   empty.classList.add('hidden');
+
+  // Dispatch on result_kind so each task renders the most useful surface.
+  // Older servers (pre-0.4.5) won't ship result_kind — default to "logits".
+  const kind = res.result_kind || 'logits';
+  switch (kind) {
+    case 'boxes':         _pgRenderBoxes(preds);             break;
+    case 'depth':         _pgRenderDepth(preds);             break;
+    case 'masks':         _pgRenderMasks(preds);             break;
+    case 'qa_spans':      _pgRenderQA(preds);                break;
+    case 'generated_text':_pgRenderGeneratedText(preds);     break;
+    case 'token_spans':   _pgRenderTokenSpans(preds);        break;
+    default:              _pgRenderLogitsBars(preds);
+  }
+}
+
+/* ----- renderers — one per result_kind ----- */
+
+function _pgRenderLogitsBars(preds) {
+  const bars = document.getElementById('pg-bars');
   bars.classList.remove('hidden');
   const maxProb = Math.max(...preds.map(p => p.probability ?? 0));
   bars.innerHTML = preds.map((p, i) => {
@@ -2825,7 +2852,6 @@ function pgRenderResults(res) {
     const pct = (prob * 100).toFixed(1);
     const w = maxProb > 0 ? (prob / maxProb * 100).toFixed(1) : 0;
     const top = i === 0;
-    // Prefer the human-readable class name if the server sent one
     const human = p.class_name ?? p.label ?? '';
     const showId = (p.class_name && p.label != null && String(p.class_name) !== String(p.label));
     return `
@@ -2843,6 +2869,201 @@ function pgRenderResults(res) {
       </div>`;
   }).join('');
 }
+
+/**
+ * Object-detection: overlay each predicted bbox on the image the user
+ * dropped. Boxes come back in xyxy_norm coordinates (0..1) so scaling
+ * to the rendered <img> is just `coord * naturalWidth`.
+ */
+function _pgRenderBoxes(preds) {
+  const host = document.getElementById('pg-rich-image');
+  const bars = document.getElementById('pg-bars');
+  bars.classList.remove('hidden');   // also show top-K bar list alongside
+  host.classList.remove('hidden');
+
+  const palette = ['#22d3ee', '#f59e0b', '#a78bfa', '#34d399',
+                   '#f87171', '#fb923c', '#60a5fa', '#fbbf24'];
+
+  // Render image + box overlay on a stacked canvas. We use the
+  // user-dropped image (still in pgImageB64) as the base; if it's
+  // missing the model didn't actually have an image input.
+  if (!pgImageB64) {
+    host.innerHTML = `<div class="text-xs text-faint">No image preview available — drop an image and re-run to see overlays.</div>`;
+  } else {
+    host.innerHTML = `
+      <div style="position:relative;display:inline-block;max-width:100%">
+        <img id="pg-box-img" src="data:image/*;base64,${pgImageB64}"
+             style="max-width:100%;display:block;border-radius:6px" />
+        <canvas id="pg-box-canvas" style="position:absolute;top:0;left:0;pointer-events:none"></canvas>
+      </div>
+      <div class="text-xs text-faint mt-2">${preds.length} detection(s) · top score ${
+        preds[0]?.probability != null
+          ? (preds[0].probability * 100).toFixed(1) + '%'
+          : '—'}</div>`;
+    const img = document.getElementById('pg-box-img');
+    const canvas = document.getElementById('pg-box-canvas');
+    const draw = () => {
+      const w = img.clientWidth, h = img.clientHeight;
+      // Use displayed (CSS) size for canvas drawing surface so coords
+      // align with what the user sees, regardless of the natural res.
+      canvas.width = w; canvas.height = h;
+      canvas.style.width = w + 'px'; canvas.style.height = h + 'px';
+      const ctx = canvas.getContext('2d');
+      ctx.lineWidth = 2;
+      ctx.font = 'bold 12px ui-sans-serif, system-ui, -apple-system, sans-serif';
+      preds.forEach((p, i) => {
+        const md = p.metadata || {};
+        const bb = md.bbox;
+        if (!Array.isArray(bb) || bb.length !== 4) return;
+        const color = palette[i % palette.length];
+        const [x1, y1, x2, y2] = bb;
+        const px = x1 * w, py = y1 * h;
+        const pw = (x2 - x1) * w, ph = (y2 - y1) * h;
+        ctx.strokeStyle = color;
+        ctx.strokeRect(px, py, pw, ph);
+        // Label with score, on a small filled background.
+        const score = p.probability != null ? (p.probability * 100).toFixed(0) + '%' : '';
+        const label = `${p.class_name || p.label} ${score}`.trim();
+        const tw = ctx.measureText(label).width + 8;
+        ctx.fillStyle = color;
+        ctx.fillRect(px, Math.max(0, py - 16), tw, 16);
+        ctx.fillStyle = '#0d0e10';
+        ctx.fillText(label, px + 4, Math.max(12, py - 4));
+      });
+    };
+    if (img.complete) draw(); else img.addEventListener('load', draw);
+    window.addEventListener('resize', draw, { once: false });
+  }
+
+  // Also show the top-K bar list — useful when the boxes are small or
+  // overlap; the bars give a clear ranking by score.
+  _pgRenderLogitsBars(preds);
+}
+
+/**
+ * Depth estimation: render the colormapped PNG thumbnail the server
+ * shipped, plus the depth-stat summary as a caption.
+ */
+function _pgRenderDepth(preds) {
+  const host = document.getElementById('pg-rich-image');
+  host.classList.remove('hidden');
+  const p = preds[0] || {};
+  const md = p.metadata || {};
+  if (!md.image_b64) {
+    host.innerHTML = `<div class="text-xs text-faint">${escapeHtml(p.class_name || '(no depth output)')}</div>`;
+    return;
+  }
+  const minVal = md.min ?? '—';
+  const maxVal = md.max ?? '—';
+  host.innerHTML = `
+    <div style="text-align:center">
+      <img src="data:${escapeHtml(md.image_mime || 'image/png')};base64,${md.image_b64}"
+           alt="depth map" style="max-width:100%;border-radius:6px" />
+      <div class="text-xs text-faint mt-2">
+        ${escapeHtml(String(p.class_name || ''))}<br>
+        Range [${minVal}, ${maxVal}] · viridis colormap (closer = brighter)
+      </div>
+    </div>`;
+}
+
+/**
+ * Segmentation: gallery of per-class mask thumbnails. Each carries a
+ * coverage percentage so users can spot which classes are present.
+ */
+function _pgRenderMasks(preds) {
+  const host = document.getElementById('pg-rich-image');
+  host.classList.remove('hidden');
+  if (!preds.length || !preds[0].metadata?.image_b64) {
+    host.innerHTML = `<div class="text-xs text-faint">No mask thumbnails returned.</div>`;
+    return;
+  }
+  const cards = preds.map((p) => {
+    const md = p.metadata || {};
+    const cov = md.coverage != null ? (md.coverage * 100).toFixed(1) + '%' : '';
+    return `
+      <div style="border:1px solid var(--border);border-radius:6px;padding:6px;background:var(--bg-elev);text-align:center">
+        <img src="data:${escapeHtml(md.image_mime || 'image/png')};base64,${md.image_b64}"
+             style="max-width:100%;border-radius:4px;image-rendering:pixelated" />
+        <div class="text-xs mt-1">${escapeHtml(p.class_name || ('class_' + p.label))}</div>
+        <div class="text-xs text-faint">${cov}</div>
+      </div>`;
+  }).join('');
+  host.innerHTML = `
+    <div class="text-xs text-muted mb-2">Top ${preds.length} class mask(s) by area</div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px">${cards}</div>`;
+}
+
+/**
+ * Question-answering: highlight the answer span in the user's context
+ * (when present) plus show the decoded text + confidence.
+ */
+function _pgRenderQA(preds) {
+  const host = document.getElementById('pg-rich-text');
+  host.classList.remove('hidden');
+  const p = preds[0] || {};
+  const md = p.metadata || {};
+  const answer = p.class_name || '(no answer)';
+  const conf = p.probability != null ? (p.probability * 100).toFixed(1) + '%' : '—';
+
+  // If the user supplied context, highlight the decoded answer inside
+  // it. Otherwise just show the answer.
+  const contextEl = document.getElementById('pg-context');
+  const context = contextEl ? contextEl.value : '';
+  let body;
+  if (context && answer && answer !== '(no answer)') {
+    const idx = context.toLowerCase().indexOf(answer.toLowerCase());
+    if (idx >= 0) {
+      body = escapeHtml(context.slice(0, idx))
+        + `<mark style="background:var(--accent-soft);color:var(--fg)">`
+        +   escapeHtml(context.slice(idx, idx + answer.length))
+        + `</mark>`
+        + escapeHtml(context.slice(idx + answer.length));
+    } else {
+      body = escapeHtml(context);
+    }
+  } else {
+    body = `<strong>${escapeHtml(answer)}</strong>`;
+  }
+  host.innerHTML = `
+    <div class="text-xs text-muted mb-2">Answer · confidence ${conf}
+      ${md.start_idx != null ? ` · tokens ${md.start_idx}–${md.end_idx}` : ''}</div>
+    <div>${body}</div>`;
+}
+
+/** ASR / summarization / translation / image-to-text / chat — render the
+ * decoded text in a roomy card. */
+function _pgRenderGeneratedText(preds) {
+  const host = document.getElementById('pg-rich-text');
+  host.classList.remove('hidden');
+  const text = preds.map(p => p.class_name || '').filter(Boolean).join('\n\n')
+                || '(empty generation)';
+  host.textContent = text;
+}
+
+/** Token-classification (NER, etc.) — list each tagged span with
+ * its label and confidence. */
+function _pgRenderTokenSpans(preds) {
+  const host = document.getElementById('pg-rich-spans');
+  host.classList.remove('hidden');
+  const palette = ['#22d3ee', '#f59e0b', '#a78bfa', '#34d399',
+                   '#f87171', '#fb923c', '#60a5fa', '#fbbf24'];
+  // Group consecutive tokens with the same class — that's roughly how
+  // BIO tags would render. Loose grouping; fine for a preview.
+  const items = preds.map((p, i) => {
+    const color = palette[(p.label ?? 0) % palette.length];
+    const conf = p.probability != null ? (p.probability * 100).toFixed(0) + '%' : '';
+    const tok = p.metadata?.token || `tok#${p.metadata?.token_idx ?? '?'}`;
+    return `
+      <div style="display:inline-flex;gap:6px;align-items:center;padding:4px 8px;border-radius:6px;border:1px solid ${color};background:rgba(255,255,255,0.02);margin:2px">
+        <span class="text-mono text-xs">${escapeHtml(String(tok))}</span>
+        <span class="text-xs" style="color:${color};font-weight:600">${escapeHtml(p.class_name)}</span>
+        <span class="text-xs text-faint">${conf}</span>
+      </div>`;
+  }).join('');
+  host.innerHTML = `
+    <div class="text-xs text-muted mb-2">${preds.length} tagged token(s)</div>
+    <div>${items}</div>`;
+}
 function pgToggleJson() {
   pgJsonOpen = !pgJsonOpen;
   document.getElementById('pg-json').classList.toggle('hidden', !pgJsonOpen);
@@ -2854,6 +3075,11 @@ function pgClearResults() {
   document.getElementById('pg-json').classList.add('hidden');
   document.getElementById('pg-error').classList.add('hidden');
   document.getElementById('pg-latency').textContent = '';
+  // Clear the structured-output renderers (boxes/depth/masks/qa/spans).
+  ['pg-rich-image', 'pg-rich-text', 'pg-rich-spans'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) { el.classList.add('hidden'); el.innerHTML = ''; }
+  });
   // Clear universal-input state — text + context + labels + every b64 field.
   pgImageB64 = null; _pgAudioB64 = null; _pgVideoB64 = null;
   _pgFileMime = null; pgLastReq = pgLastRes = null;

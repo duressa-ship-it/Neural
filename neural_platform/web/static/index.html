@@ -1048,6 +1048,18 @@ neural init --model transformer --name text_classifier</div>
           <div>Run a prediction to see results here</div>
         </div>
         <div id="pg-bars" class="hidden"></div>
+        <!--
+          Structured-output renderers — visible only when the server
+          returns the matching result_kind. Each shows different content:
+            #pg-rich-image: object-detection (boxes overlay) + depth/mask thumbnails
+            #pg-rich-text:  generated text / decoded answer / span highlights
+            #pg-rich-spans: token-classification spans with probabilities
+        -->
+        <div id="pg-rich-image" class="hidden mt-2"
+             style="position:relative;border:1px solid var(--border);border-radius:8px;padding:6px;background:var(--bg-elev)"></div>
+        <div id="pg-rich-text"  class="hidden mt-2"
+             style="border:1px solid var(--border);border-radius:8px;padding:10px 12px;background:var(--bg-elev);white-space:pre-wrap;line-height:1.5;font-size:14px"></div>
+        <div id="pg-rich-spans" class="hidden mt-2"></div>
         <div id="pg-json" class="hidden mt-3">
           <div class="text-xs text-muted mb-2">Request</div>
           <div class="code-block" id="pg-json-req" style="max-height:160px"></div>

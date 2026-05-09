@@ -156,18 +156,65 @@ class PredictRequest(PydanticModel):
 
 
 class Prediction(PydanticModel):
-    """One prediction. `class_name` is populated when the checkpoint includes class labels."""
+    """One prediction. ``class_name`` is populated when the checkpoint
+    includes class labels.
+
+    ``metadata`` carries structured-output details that don't fit in a
+    flat (label, probability) pair:
+
+      * **Object detection** — ``{"bbox": [x1, y1, x2, y2], "format": "xyxy_norm"}``
+        (boxes are in [0,1] of the image dimensions).
+      * **QA spans** — ``{"start_idx": int, "end_idx": int}`` so the
+        client can highlight the matched span in the input.
+      * **Token classification** — ``{"offsets": [[s,e],…], "tokens": [...]}``
+        the per-token labels with character offsets back into the user's text.
+
+    The frontend dispatches on :attr:`PredictResponse.result_kind`; this
+    field is the data backing each renderer.
+    """
     label: int = Field(..., description="Class index (0-based)")
     class_name: Optional[str] = Field(None, description="Human-readable class name, if known")
     probability: Optional[float] = Field(None, description="Softmax probability (0–1)")
     score: Optional[float] = Field(None, description="Raw logit value")
+    metadata: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "Structured-output details for non-classification tasks "
+            "(bbox / qa span indices / token offsets / depth stats / mask "
+            "thumbnails). Schema depends on PredictResponse.result_kind."
+        ),
+    )
 
 
 class PredictResponse(PydanticModel):
-    """Top-K predictions for each input sample."""
+    """Top-K predictions for each input sample.
+
+    ``result_kind`` lets the client pick the right renderer without
+    inferring from the task name:
+
+      * ``"logits"`` — standard classification (default; existing top-K bars).
+      * ``"generated_text"`` — ASR / summarization / translation /
+        text-generation / image-to-text. Single Prediction with the
+        decoded text in ``class_name``.
+      * ``"qa_spans"`` — question-answering. Single Prediction whose
+        ``metadata`` has ``start_idx`` / ``end_idx`` in addition to the
+        decoded answer string.
+      * ``"boxes"`` — object detection. One Prediction per detected box,
+        bbox in metadata.
+      * ``"depth"`` — depth estimation. One Prediction whose metadata
+        carries a base64 PNG colormap thumbnail of the depth map.
+      * ``"masks"`` — segmentation. Top-N class masks, each as a base64
+        PNG thumbnail in metadata.
+      * ``"token_spans"`` — token classification. One Prediction per
+        non-trivial span, with character offsets back into the input.
+    """
     predictions: List[List[Prediction]] = Field(..., description="One inner list per sample")
     model_type: str
     latency_ms: float = Field(..., description="Server-side inference latency in ms")
+    result_kind: str = Field(
+        "logits",
+        description="What kind of structured result this is — drives the UI's renderer choice.",
+    )
 
 
 class HealthResponse(PydanticModel):
@@ -712,6 +759,7 @@ def create_inference_app(config: ExperimentConfig,
                         predictions=[[pred]],
                         model_type=model_type,
                         latency_ms=round(latency_ms, 2),
+                        result_kind="generated_text",
                     )
 
                 # ---- non-generative path (existing behavior) -------------
@@ -754,6 +802,18 @@ def create_inference_app(config: ExperimentConfig,
 
         if spec.output_kind == POSTPROC_MASKS and not isinstance(raw_output, torch.Tensor):
             return _masks_response(raw_output, model_type, t0)
+
+        # Token classification — per-token labels with character offsets
+        # so the UI can highlight spans in the original text. Runs *before*
+        # the generic logits path because the model output is logits but
+        # we want span-level rendering, not document-level top-K.
+        if spec.output_kind == POSTPROC_TOKEN_LOGITS:
+            tensor = raw_output if isinstance(raw_output, torch.Tensor) else getattr(raw_output, "logits", None)
+            if isinstance(tensor, torch.Tensor):
+                return _token_spans_response(
+                    tensor, tensor_input, container.get("processor"),
+                    model_type, t0, class_names, request.top_k,
+                )
 
         # Anything else: treat the output as logits. If we still got a
         # structured output (e.g. an unknown HF output shape), pull
@@ -1685,6 +1745,65 @@ def _decode_video_b64(b64: str, *, file_mime: Optional[str] = None,
 # logits-based path: a single-sample top-K list with `class_name`
 # carrying the human-readable answer.
 
+def _tensor_to_png_b64(tensor: torch.Tensor, *, max_dim: int = 256) -> Optional[str]:
+    """Render a 2-D float tensor as a base64-encoded PNG thumbnail.
+
+    Used for depth maps + segmentation masks where the raw tensor is
+    too large to ship over JSON but a small thumbnail is plenty for the
+    Predict UI to display. Min-max normalizes to [0, 255], applies a
+    perceptual colormap (viridis when matplotlib is around, plain
+    grayscale otherwise), and downsamples to fit ``max_dim`` on the
+    longer side.
+    """
+    try:
+        import io
+        import base64
+        from PIL import Image
+        import numpy as np
+
+        t = tensor.detach().float().cpu()
+        # Squeeze leading singletons until we have 2-D HxW.
+        while t.dim() > 2 and t.size(0) == 1:
+            t = t.squeeze(0)
+        if t.dim() != 2:
+            # Multi-channel / per-class — take argmax over channels for masks.
+            if t.dim() == 3:
+                t = t.argmax(dim=0).float()
+            else:
+                return None
+        # Min-max normalize to [0, 1].
+        lo, hi = float(t.min()), float(t.max())
+        if hi - lo > 1e-9:
+            t = (t - lo) / (hi - lo)
+        else:
+            t = torch.zeros_like(t)
+        arr = (t.numpy() * 255).astype(np.uint8)
+
+        # Optional viridis colormap when matplotlib is installed. mpl 3.7+
+        # moved cm.get_cmap → matplotlib.colormaps; try the new API first
+        # so we don't trip the deprecation warning on every depth render.
+        try:
+            try:
+                import matplotlib   # type: ignore
+                cmap = matplotlib.colormaps.get_cmap("viridis")
+            except (ImportError, AttributeError):
+                import matplotlib.cm as cm   # type: ignore
+                cmap = cm.get_cmap("viridis")
+            colored = cmap(arr / 255.0)
+            arr = (colored[..., :3] * 255).astype(np.uint8)
+            img = Image.fromarray(arr, mode="RGB")
+        except Exception:
+            img = Image.fromarray(arr, mode="L")
+
+        # Thumbnail down to keep the response small.
+        img.thumbnail((max_dim, max_dim))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:
+        return None
+
+
 def _qa_response(outputs, tensor_input, processor, model_type: str,
                  t0: float) -> "PredictResponse":
     """Decode a question-answering structured output to a span string.
@@ -1730,9 +1849,16 @@ def _qa_response(outputs, tensor_input, processor, model_type: str,
             class_name=answer.strip() or "(empty span)",
             probability=round(confidence, 6),
             score=None,
+            metadata={
+                "start_idx": int(start),
+                "end_idx": int(end),
+                "start_prob": round(s_prob, 6),
+                "end_prob": round(e_prob, 6),
+            },
         )]],
         model_type=model_type,
         latency_ms=round(latency_ms, 2),
+        result_kind="qa_spans",
     )
 
 
@@ -1740,10 +1866,16 @@ def _boxes_response(outputs, model_type: str, t0: float, class_names_fn
                      ) -> "PredictResponse":
     """Render object-detection output as one Prediction per detected box.
 
-    Shape: each Prediction's ``class_name`` carries
-    ``"<label> @ x1,y1,x2,y2"`` so the existing Predict UI can render
-    something useful without a custom widget. ``probability`` carries
-    the detection score.
+    Each Prediction carries:
+      * ``class_name`` — the human-readable label (no longer the
+        coordinate-stuffed string the UI used to parse).
+      * ``probability`` — detection score (softmax over class logits).
+      * ``metadata.bbox`` — ``[x1, y1, x2, y2]`` in normalized [0, 1]
+        image-space coordinates. ``metadata.format`` always
+        ``"xyxy_norm"`` so the client knows how to scale.
+
+    The frontend overlays these on the previewed image via a canvas;
+    older clients still see the label + score with no special handling.
     """
     pred_boxes = getattr(outputs, "pred_boxes", None)
     logits = getattr(outputs, "logits", None)
@@ -1753,6 +1885,7 @@ def _boxes_response(outputs, model_type: str, t0: float, class_names_fn
             predictions=[[Prediction(label=0, class_name="(no detections)",
                                        probability=None, score=None)]],
             model_type=model_type, latency_ms=round(latency_ms, 2),
+            result_kind="boxes",
         )
     # logits: (1, num_queries, num_classes+1) — argmax over classes
     scores = torch.softmax(logits[0], dim=-1)
@@ -1770,51 +1903,78 @@ def _boxes_response(outputs, model_type: str, t0: float, class_names_fn
         name = class_names_fn(label_id) or f"class_{label_id}"
         preds.append(Prediction(
             label=label_id,
-            class_name=f"{name} @ {x1:.2f},{y1:.2f},{x2:.2f},{y2:.2f}",
+            class_name=name,
             probability=round(float(top_v[rank].item()), 6),
             score=None,
+            metadata={
+                "bbox": [round(x1, 6), round(y1, 6),
+                          round(x2, 6), round(y2, 6)],
+                "format": "xyxy_norm",
+            },
         ))
     latency_ms = (time.time() - t0) * 1000
     return PredictResponse(
         predictions=[preds],
         model_type=model_type,
         latency_ms=round(latency_ms, 2),
+        result_kind="boxes",
     )
 
 
 def _depth_response(outputs, model_type: str, t0: float) -> "PredictResponse":
-    """Render depth-estimation output as a single Prediction whose
-    ``class_name`` summarizes the depth map's stats. The full map can be
-    huge, so we don't ship it back over the wire — clients that want the
-    raw tensor should call /predict via a dedicated endpoint."""
+    """Render depth-estimation output as a viridis colormap thumbnail.
+
+    The depth map can be hundreds of KB as a raw tensor — far too big
+    for a single Predict round-trip. Min-max-normalize, colormap, and
+    ship a 256×256 PNG thumbnail in metadata.image_b64. The frontend
+    renders that inline and shows the depth-stat summary alongside.
+    """
     depth = getattr(outputs, "predicted_depth", None)
+    latency_ms = (time.time() - t0) * 1000
     if depth is None:
-        latency_ms = (time.time() - t0) * 1000
         return PredictResponse(
             predictions=[[Prediction(label=0, class_name="(no depth output)",
                                       probability=None, score=None)]],
             model_type=model_type, latency_ms=round(latency_ms, 2),
+            result_kind="depth",
         )
     d = depth.float()
+    png_b64 = _tensor_to_png_b64(d)
     summary = (
         f"depth map {tuple(d.shape)} — "
         f"min={float(d.min()):.3f} max={float(d.max()):.3f} "
         f"mean={float(d.mean()):.3f}"
     )
-    latency_ms = (time.time() - t0) * 1000
     return PredictResponse(
-        predictions=[[Prediction(label=0, class_name=summary,
-                                  probability=None,
-                                  score=round(float(d.mean().item()), 6))]],
+        predictions=[[Prediction(
+            label=0,
+            class_name=summary,
+            probability=None,
+            score=round(float(d.mean().item()), 6),
+            metadata={
+                "image_b64":  png_b64,
+                "image_mime": "image/png",
+                "shape":      list(d.shape),
+                "min":        round(float(d.min()), 6),
+                "max":        round(float(d.max()), 6),
+                "mean":       round(float(d.mean()), 6),
+            },
+        )]],
         model_type=model_type,
         latency_ms=round(latency_ms, 2),
+        result_kind="depth",
     )
 
 
 def _masks_response(outputs, model_type: str, t0: float) -> "PredictResponse":
-    """Render segmentation output as a summary string. The mask tensor
-    itself is too large for a JSON response — clients that need pixel
-    masks should consume the model directly."""
+    """Render segmentation output as one Prediction per non-trivial
+    class mask, each carrying a base64 PNG thumbnail of that class's
+    mask + a coverage percentage.
+
+    For models that emit per-class logits ``(C, H, W)``, we argmax to
+    a single label map and surface up to ``top_n`` distinct classes
+    ranked by pixel coverage.
+    """
     masks = (getattr(outputs, "pred_masks", None)
              or getattr(outputs, "logits", None))
     latency_ms = (time.time() - t0) * 1000
@@ -1823,10 +1983,138 @@ def _masks_response(outputs, model_type: str, t0: float) -> "PredictResponse":
             predictions=[[Prediction(label=0, class_name="(no mask output)",
                                       probability=None, score=None)]],
             model_type=model_type, latency_ms=round(latency_ms, 2),
+            result_kind="masks",
         )
+
+    m = masks.float()
+    # Squeeze leading singletons (1, C, H, W) → (C, H, W)
+    while m.dim() > 3 and m.size(0) == 1:
+        m = m.squeeze(0)
+
+    preds: List[Prediction] = []
+    if m.dim() == 3:
+        # (C, H, W): argmax across classes, then surface top-N by area.
+        label_map = m.argmax(dim=0)
+        unique, counts = torch.unique(label_map, return_counts=True)
+        # Sort by count descending; cap at 6 classes to keep payload small.
+        order = torch.argsort(counts, descending=True)
+        for rank in range(min(6, unique.size(0))):
+            idx = int(order[rank].item())
+            cls_id = int(unique[idx].item())
+            count = int(counts[idx].item())
+            coverage = count / float(label_map.numel())
+            mask_bin = (label_map == cls_id).float()
+            png_b64 = _tensor_to_png_b64(mask_bin)
+            preds.append(Prediction(
+                label=cls_id,
+                class_name=f"class_{cls_id}",
+                probability=round(coverage, 6),
+                score=None,
+                metadata={
+                    "image_b64":  png_b64,
+                    "image_mime": "image/png",
+                    "coverage":   round(coverage, 6),
+                    "shape":      list(label_map.shape),
+                },
+            ))
+    else:
+        # 2-D mask (rare): single Prediction with the whole map.
+        preds.append(Prediction(
+            label=0,
+            class_name=f"segmentation map {tuple(m.shape)}",
+            probability=None, score=None,
+            metadata={
+                "image_b64":  _tensor_to_png_b64(m),
+                "image_mime": "image/png",
+                "shape":      list(m.shape),
+            },
+        ))
+
     return PredictResponse(
-        predictions=[[Prediction(label=0,
-                                  class_name=f"segmentation map {tuple(masks.shape)}",
-                                  probability=None, score=None)]],
+        predictions=[preds],
         model_type=model_type, latency_ms=round(latency_ms, 2),
+        result_kind="masks",
+    )
+
+
+def _token_spans_response(logits: torch.Tensor, tensor_input,
+                            processor, model_type: str, t0: float,
+                            class_names: Optional[List[str]],
+                            top_k: int) -> "PredictResponse":
+    """Render token-classification output as per-token labels with
+    character offsets back into the input text.
+
+    Used for NER, POS tagging, and other token-level tasks. The frontend
+    highlights the spans in the user's text input. Falls back to the
+    averaged top-K path (the existing _build_predictions behavior) when
+    the tokenizer doesn't provide offsets.
+    """
+    latency_ms = (time.time() - t0) * 1000
+    # logits: typically (1, seq_len, num_classes). Squeeze to (seq, C).
+    while logits.dim() > 2 and logits.size(0) == 1:
+        logits = logits.squeeze(0)
+    if logits.dim() != 2:
+        # Unexpected shape — fall back to the regular top-K path.
+        return PredictResponse(
+            predictions=[_build_predictions(logits, top_k, True, class_names)],
+            model_type=model_type, latency_ms=round(latency_ms, 2),
+            result_kind="logits",
+        )
+
+    probs = torch.softmax(logits, dim=-1)
+    preds_per_token = probs.argmax(dim=-1)
+    confs = probs.max(dim=-1).values
+
+    # Try to recover character offsets from the tokenizer. The processor
+    # may carry that on its `tokenizer` attribute (Whisper-style) or be
+    # a tokenizer itself.
+    offsets = None
+    tokens = None
+    input_ids = (tensor_input.get("input_ids")
+                  if isinstance(tensor_input, dict) else None)
+    tok = getattr(processor, "tokenizer", processor)
+    if input_ids is not None and tok is not None:
+        try:
+            ids = (input_ids[0] if input_ids.dim() > 1 else input_ids).tolist()
+            tokens = tok.convert_ids_to_tokens(ids)
+        except Exception:
+            tokens = None
+
+    spans: List[Prediction] = []
+    seq_len = preds_per_token.size(0)
+    for i in range(seq_len):
+        cls_id = int(preds_per_token[i].item())
+        # Skip O / padding by default — the user-facing surface is the
+        # *non-trivial* tagged tokens. We treat label 0 as the
+        # background class (matches the BIO convention).
+        if cls_id == 0:
+            continue
+        name = _lookup_class(class_names, cls_id) or f"class_{cls_id}"
+        spans.append(Prediction(
+            label=cls_id,
+            class_name=name,
+            probability=round(float(confs[i].item()), 6),
+            score=None,
+            metadata={
+                "token_idx": i,
+                "token":     (tokens[i] if tokens and i < len(tokens) else None),
+            },
+        ))
+        if len(spans) >= top_k:
+            break
+
+    if not spans:
+        # Fallback: at least show the document-level top-K so the UI
+        # has something to render.
+        return PredictResponse(
+            predictions=[_build_predictions(
+                logits, top_k, True, class_names)],
+            model_type=model_type, latency_ms=round(latency_ms, 2),
+            result_kind="logits",
+        )
+
+    return PredictResponse(
+        predictions=[spans],
+        model_type=model_type, latency_ms=round(latency_ms, 2),
+        result_kind="token_spans",
     )
