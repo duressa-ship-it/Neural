@@ -376,7 +376,17 @@ PIPELINE_SPECS: Dict[str, PipelineSpec] = {
     "automatic-speech-recognition": PipelineSpec(
         task="automatic-speech-recognition",
         coarse_task=Task.AUTOMATIC_SPEECH_RECOGNITION,
-        auto_classes=("AutoModelForSpeechSeq2Seq",),
+        # Two families of ASR models on the Hub:
+        #   * Seq2Seq encoder-decoder (Whisper / Voxtral / Speech2Text /
+        #     SeamlessM4T) — call .generate(), decode tokens.
+        #   * CTC (Wav2Vec2 / HuBERT / MMS / google/medasr / Lasr) —
+        #     forward pass returns per-frame logits, argmax + CTC-decode
+        #     to text. These have no .generate().
+        # Try seq2seq first since Whisper is the most popular default;
+        # AutoModelForCTC handles everything else. The server detects
+        # which variant loaded at predict time and dispatches
+        # accordingly (no generation for CTC).
+        auto_classes=("AutoModelForSpeechSeq2Seq", "AutoModelForCTC"),
         processor_kind=PROCESSOR_PROCESSOR,
         input_kind=INPUT_AUDIO,
         output_kind=POSTPROC_GENERATED_TEXT,
@@ -386,7 +396,8 @@ PIPELINE_SPECS: Dict[str, PipelineSpec] = {
             "Send `inputs` as a flat list of float32 waveform samples at the "
             "model's expected sample rate (Whisper: 16kHz). The processor "
             "converts to log-mel features automatically; the server then "
-            "runs `.generate()` and decodes back to text."
+            "runs `.generate()` (Whisper-style) or forward + CTC decode "
+            "(Wav2Vec2-style) and returns text."
         ),
     ),
     "voice-activity-detection": PipelineSpec(

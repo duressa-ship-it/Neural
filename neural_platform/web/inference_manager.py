@@ -396,11 +396,17 @@ class InferenceServerManager:
         except Exception:
             return {"text": r.text}
 
-    async def proxy_stream(self, server_id: str, path: str,
-                            json_body: Optional[dict] = None,
-                            timeout_s: float = 600.0):
+    def proxy_stream(self, server_id: str, path: str,
+                      json_body: Optional[dict] = None,
+                      timeout_s: float = 600.0):
         """Async-generator proxy that forwards an SSE stream from the
         held server with its bearer token attached.
+
+        Returns an **async generator** directly (not a coroutine). The
+        caller does ``async for chunk in mgr.proxy_stream(...)``; the
+        old ``async def`` form returned a coroutine that ASGI couldn't
+        iterate, surfacing as ``'async for' requires __aiter__, got
+        coroutine`` from inside Starlette's StreamingResponse.
 
         Yields raw bytes chunks suitable for re-emission via
         ``StreamingResponse``. The token never appears in the yielded

@@ -265,7 +265,7 @@ class TestProxyStream:
                 return _FakeStreamCtx(_FakeResp())
 
         with patch("httpx.AsyncClient", _FakeAsyncClient):
-            agen = await mgr.proxy_stream(
+            agen = mgr.proxy_stream(
                 "abc", "/predict/stream", json_body={"text": "hi"},
             )
             collected = b""
@@ -322,7 +322,7 @@ class TestProxyStream:
                 return _FakeStreamCtx(_FakeResp())
 
         with patch("httpx.AsyncClient", _FakeAsyncClient):
-            agen = await mgr.proxy_stream("abc", "/predict/stream",
+            agen = mgr.proxy_stream("abc", "/predict/stream",
                                             json_body={})
             collected = b""
             async for chunk in agen:

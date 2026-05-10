@@ -1850,6 +1850,9 @@ def create_dashboard_app(output_dir: str = "runs") -> FastAPI:
         """
         from fastapi.responses import StreamingResponse as _SSE
         try:
+            # proxy_stream returns an async generator directly (not a
+            # coroutine) — calling it with `await` would yield a
+            # coroutine that ASGI can't iterate.
             agen = inference_mgr.proxy_stream(
                 server_id, "/predict/stream", json_body=body,
             )

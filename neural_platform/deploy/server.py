@@ -310,6 +310,16 @@ class InfoResponse(PydanticModel):
             "chat transcript pane instead of the single-turn input."
         ),
     )
+    load_warnings: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "HF transformers LOAD REPORT captured at startup, when the "
+            "checkpoint's parameter keys don't match the loaded auto "
+            "class. Carries counts + example names for `missing` "
+            "(newly initialized, possibly random head weights) and "
+            "`unexpected` (skipped) keys. None when load was clean."
+        ),
+    )
     # UI hint dictionary derived from the pipeline_specs table — the
     # Predict tab reads this off /info and renders a single universal
     # input panel whose visible fields adapt to the connected model.
@@ -497,6 +507,17 @@ def create_inference_app(config: ExperimentConfig,
 
     @app.on_event("startup")
     async def load_model():
+        # Install transformers compatibility shims before any
+        # from_pretrained call. Some 2023-era trust_remote_code repos
+        # import symbols that moved in newer transformers releases
+        # (DisjunctiveConstraint, SampleOutput, etc.); the shim
+        # restores those names at their old paths so the remote
+        # modeling_*.py can still load.
+        try:
+            from neural_platform.core.hf_compat import install_compat_shims
+            install_compat_shims()
+        except Exception:
+            pass
         if checkpoint_path:
             model, meta = adapter.load_checkpoint(checkpoint_path)
         else:
@@ -597,6 +618,23 @@ def create_inference_app(config: ExperimentConfig,
             mtype = config.model.type.value
             ui_hint_dict = _native_ui_hint(mtype)
 
+        # Pull the HF LOAD REPORT off the wrapper (if any). The wrapper
+        # captures transformers' stderr during from_pretrained; we
+        # condense the captured dict into a small summary for the UI.
+        load_warnings: Optional[Dict[str, Any]] = None
+        try:
+            report = getattr(getattr(model, "encoder", model),
+                              "_nf_load_report", None)
+            if report and (report.get("missing") or report.get("unexpected")):
+                load_warnings = {
+                    "missing_count":    len(report.get("missing", [])),
+                    "unexpected_count": len(report.get("unexpected", [])),
+                    "missing_examples":    (report.get("missing", []) or [])[:6],
+                    "unexpected_examples": (report.get("unexpected", []) or [])[:6],
+                }
+        except Exception:
+            pass
+
         # Detect chat-template support on the loaded processor /
         # tokenizer. The Predict UI surfaces a chat transcript pane
         # whenever this is True, regardless of pipeline_task.
@@ -642,6 +680,7 @@ def create_inference_app(config: ExperimentConfig,
             processor_class=processor_class,
             ui_hint=ui_hint_dict,
             has_chat_template=has_chat_template,
+            load_warnings=load_warnings,
         )
 
     @app.get("/info/layers", response_model=LayersResponse, tags=["System"], summary="Per-layer breakdown")
@@ -838,9 +877,52 @@ def create_inference_app(config: ExperimentConfig,
                 # logits gives token-step probabilities — useless for the
                 # user. Run .generate() on the underlying HF encoder and
                 # decode via the loaded processor.
+                #
+                # CTC ASR models (Wav2Vec2 / Lasr / MMS) also map to a
+                # generative spec but have no .generate() — instead a
+                # forward pass returns per-frame logits that we argmax
+                # and CTC-decode. The branch below routes them there.
                 if spec.needs_generation:
                     encoder = getattr(model, "encoder", model)
                     proc = container.get("processor")
+                    is_ctc = (
+                        spec.task == "automatic-speech-recognition"
+                        and not hasattr(encoder, "generate")
+                    )
+                    if is_ctc:
+                        # Forward + argmax + tokenizer/processor decode.
+                        # The processor's tokenizer half does CTC merge
+                        # automatically when called via .batch_decode.
+                        forward_input = (tensor_input
+                                          if isinstance(tensor_input, dict)
+                                          else {"input_values": tensor_input})
+                        out = encoder(**forward_input)
+                        ctc_logits = (out.logits
+                                       if hasattr(out, "logits") else out)
+                        pred_ids = ctc_logits.argmax(dim=-1)
+                        text = None
+                        if proc is not None:
+                            try:
+                                decoded = proc.batch_decode(pred_ids)
+                                text = decoded[0] if decoded else None
+                            except Exception:
+                                try:
+                                    tok = getattr(proc, "tokenizer", proc)
+                                    text = tok.batch_decode(pred_ids)[0]
+                                except Exception:
+                                    text = None
+                        latency_ms = (time.time() - t0) * 1000
+                        return PredictResponse(
+                            predictions=[[Prediction(
+                                label=0,
+                                class_name=text if text is not None else "(CTC decode failed)",
+                                probability=None,
+                                score=None,
+                            )]],
+                            model_type=model_type,
+                            latency_ms=round(latency_ms, 2),
+                            result_kind="generated_text",
+                        )
                     if not hasattr(encoder, "generate"):
                         raise HTTPException(
                             status_code=500,
@@ -1822,7 +1904,40 @@ async def _stream_generation(*, model, processor, tensor_input, request,
         return
 
     encoder = getattr(model, "encoder", model)
+    # CTC ASR models (Wav2Vec2 / Lasr / etc.) have no .generate() but
+    # still produce text. They aren't truly streamable — the full
+    # forward pass is needed before CTC merging — but we wrap the
+    # one-shot result in the same SSE shape so the frontend's
+    # streaming branch keeps working unchanged.
     if not hasattr(encoder, "generate"):
+        if spec.task == "automatic-speech-recognition":
+            try:
+                proc = processor
+                forward_input = (tensor_input if isinstance(tensor_input, dict)
+                                  else {"input_values": tensor_input})
+                with torch.no_grad():
+                    out = encoder(**forward_input)
+                ctc_logits = out.logits if hasattr(out, "logits") else out
+                pred_ids = ctc_logits.argmax(dim=-1)
+                text = ""
+                if proc is not None:
+                    try:
+                        text = (proc.batch_decode(pred_ids) or [""])[0]
+                    except Exception:
+                        tok = getattr(proc, "tokenizer", proc)
+                        text = tok.batch_decode(pred_ids)[0]
+                yield f"event: token\ndata: {_json.dumps(text)}\n\n"
+                yield "event: done\ndata: " + _json.dumps({
+                    "text": text, "latency_ms": 0,
+                    "result_kind": "generated_text",
+                    "note": "CTC models aren't truly streamed — full forward pass first.",
+                }) + "\n\n"
+                return
+            except Exception as exc:
+                yield "event: error\ndata: " + _json.dumps({
+                    "detail": f"CTC decode failed: {exc}",
+                }) + "\n\n"
+                return
         yield "event: error\ndata: " + _json.dumps({
             "detail": f"Loaded model has no .generate() method — task "
                        f"'{spec.task}' isn't actually streamable here.",

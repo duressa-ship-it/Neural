@@ -168,7 +168,20 @@ class HFPipelineModel(BaseModel):
             )
         else:
             try:
-                self.encoder = auto_cls.from_pretrained(arch.pretrained, **load_kwargs)
+                # transformers v5 prints a LOAD REPORT to stderr when
+                # checkpoint keys don't match the architecture (UNEXPECTED
+                # / MISSING). Capture it so /info can surface a summary —
+                # users otherwise have no idea their model is loading with
+                # randomly-initialized head weights.
+                with _capture_hf_load_report() as report:
+                    self.encoder = auto_cls.from_pretrained(arch.pretrained, **load_kwargs)
+                # Stash the captured report on the model so the server's
+                # /info handler can pluck it off `encoder._nf_load_report`.
+                if report.get("text"):
+                    try:
+                        self.encoder._nf_load_report = report
+                    except Exception:
+                        pass
             except OSError as exc:
                 msg = _redact_msg(str(exc))
                 # Specific recovery for the "no recognized weight file"
@@ -324,6 +337,76 @@ def _redact_msg(msg: str) -> str:
         return redact(msg)
     except Exception:
         return msg
+
+
+def _capture_hf_load_report():
+    """Context manager that captures stderr during a HF from_pretrained
+    call and parses out the LOAD REPORT (UNEXPECTED / MISSING keys).
+
+    Returns a mutable ``dict`` that's populated on context exit:
+
+        {"text": "<raw captured text>",
+         "missing":    [list of param-pattern strings],
+         "unexpected": [list of param-pattern strings]}
+
+    Empty dict if nothing notable was printed. We avoid suppressing
+    stderr permanently because tqdm / huggingface_hub also print
+    progress there; we restore the original stream on exit.
+    """
+    import contextlib
+    import io as _io
+    import re as _re
+    import sys as _sys
+
+    captured: Dict[str, Any] = {}
+
+    @contextlib.contextmanager
+    def _ctx():
+        buf = _io.StringIO()
+        # Tee stderr: write to both the real stderr (so progress bars
+        # keep showing in the operator's terminal) AND our buffer.
+        class _Tee:
+            def __init__(self, *streams): self._streams = streams
+            def write(self, x):
+                for s in self._streams:
+                    try: s.write(x)
+                    except Exception: pass
+                return len(x)
+            def flush(self):
+                for s in self._streams:
+                    try: s.flush()
+                    except Exception: pass
+            def isatty(self): return False
+        real = _sys.stderr
+        _sys.stderr = _Tee(real, buf)
+        try:
+            yield captured
+        finally:
+            _sys.stderr = real
+            text = buf.getvalue()
+            # Only surface a report when transformers actually printed
+            # one — match its distinctive "LOAD REPORT" banner.
+            if "LOAD REPORT" not in text and "UNEXPECTED" not in text and "MISSING" not in text:
+                return
+            missing: list[str] = []
+            unexpected: list[str] = []
+            for line in text.splitlines():
+                # Lines look like:
+                #   model.layers.{0, 1, …}.attn.wq_a.weight | UNEXPECTED | …
+                if "|" not in line:
+                    continue
+                parts = [p.strip() for p in line.split("|")]
+                if len(parts) < 2:
+                    continue
+                key, status = parts[0], parts[1]
+                if status == "UNEXPECTED":
+                    unexpected.append(key)
+                elif status == "MISSING":
+                    missing.append(key)
+            captured["text"]       = text
+            captured["missing"]    = missing
+            captured["unexpected"] = unexpected
+    return _ctx()
 
 
 def _detect_repo_pattern(model_id: str):
