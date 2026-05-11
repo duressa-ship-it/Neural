@@ -1109,6 +1109,27 @@ neural init --model transformer --name text_classifier</div>
         <div class="card-title mb-3">Latency</div>
         <div class="chart-wrap" style="height:160px"><canvas id="pg-lat-chart"></canvas></div>
       </div>
+
+      <!--
+        Recent predictions sidebar — populated from /api/predict/history
+        per the connected server. Rows are clickable to replay the
+        request (text / context / candidate labels are repopulated; b64
+        binaries get a placeholder marker since they were stripped from
+        storage). Refreshes after every successful predict.
+      -->
+      <div class="card mt-3">
+        <div class="card-head">
+          <div class="card-title">Recent</div>
+          <div class="row-tight">
+            <button class="btn btn-ghost btn-xs" onclick="pgHistRefresh()" title="Reload">↻</button>
+            <button class="btn btn-ghost btn-xs" onclick="pgHistClear()" title="Clear history for this server">Clear</button>
+          </div>
+        </div>
+        <div id="pg-hist-empty" class="text-xs text-faint" style="padding:6px 2px">
+          No predictions logged yet. Run one and it'll appear here.
+        </div>
+        <div id="pg-hist-list" class="hidden" style="display:flex;flex-direction:column;gap:6px;max-height:360px;overflow-y:auto"></div>
+      </div>
     </div>
   </div>
 </section>

@@ -518,6 +518,17 @@ def create_inference_app(config: ExperimentConfig,
             install_compat_shims()
         except Exception:
             pass
+        # Register a process atexit hook that tears down joblib/loky's
+        # persistent worker pool. scikit-learn / librosa / various HF
+        # internals pull in `loky`, which spawns a reusable executor
+        # whose semaphores aren't always cleaned up before the parent
+        # exits — producing the "leaked semaphore objects" warning on
+        # every inference-server shutdown.
+        try:
+            import atexit
+            atexit.register(_shutdown_loky_pool)
+        except Exception:
+            pass
         if checkpoint_path:
             model, meta = adapter.load_checkpoint(checkpoint_path)
         else:
@@ -550,6 +561,16 @@ def create_inference_app(config: ExperimentConfig,
         # Keep the legacy "tokenizer" key around so any third-party code
         # poking at the container still finds it.
         container["tokenizer"] = processor
+
+    @app.on_event("shutdown")
+    async def teardown() -> None:
+        """Explicit shutdown so resources are released before atexit
+        runs. The loky worker pool especially needs to be torn down
+        while the asyncio loop is still alive — once we get to atexit
+        the multiprocessing resource_tracker has already started its
+        own cleanup pass and prints leak warnings if our pool's
+        semaphores are still open."""
+        _shutdown_loky_pool()
 
     # ------------------------------------------------------------------
     # System
@@ -2043,6 +2064,52 @@ def _next_or_sentinel(streamer):
         return _STREAM_END
     except Exception:
         return _STREAM_END
+
+
+_loky_already_shutdown = False
+
+
+def _shutdown_loky_pool() -> None:
+    """Close joblib/loky's persistent worker pool if one is running.
+
+    Reusable executors live in ``loky._reusable_executor`` (lazily
+    spawned by scikit-learn, librosa, and several HF internals). Their
+    worker semaphores aren't reclaimed when the parent process exits
+    abruptly, which surfaces as the warning::
+
+        resource_tracker: There appear to be 1 leaked semaphore
+        objects to clean up at shutdown: {'/loky-…-…'}
+
+    Calling ``shutdown(kill_workers=True)`` *while the event loop is
+    still alive* avoids the leak. Idempotent — successive calls (one
+    from the FastAPI shutdown hook, one from atexit as a fallback) are
+    no-ops after the first.
+    """
+    global _loky_already_shutdown
+    if _loky_already_shutdown:
+        return
+    # joblib lives in scikit-learn's deps; loky lives in joblib's.
+    # Either may be absent (e.g. minimal HF-only install) — just no-op.
+    try:
+        import joblib   # type: ignore  # noqa: F401
+        from loky import get_reusable_executor   # type: ignore
+    except Exception:
+        _loky_already_shutdown = True
+        return
+    try:
+        executor = get_reusable_executor()
+        executor.shutdown(wait=False, kill_workers=True)
+    except Exception:
+        pass
+    # Also clear joblib's own thread / fork pools, which sometimes hold
+    # their own resource_tracker entries.
+    try:
+        import joblib._parallel_backends as _pb   # type: ignore
+        # ThreadingBackend / LokyBackend keep singletons keyed by name.
+        _pb._BACKENDS.clear()
+    except Exception:
+        pass
+    _loky_already_shutdown = True
 
 
 def _native_ui_hint(model_type: str) -> Dict[str, Any]:

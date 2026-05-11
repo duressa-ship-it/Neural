@@ -2449,6 +2449,9 @@ async function pgConnect() {
     // chat_template. Replaces the universal input panel for these
     // models since multi-turn is the natural way to use them.
     pgSetChatMode(!!info.has_chat_template);
+    // Refresh the "Recent" sidebar so users immediately see their
+    // prior history for this server.
+    pgHistRefresh();
     toast('Connected to inference server', 'success');
   } catch (e) {
     pgSetStatus('err', 'Cannot reach server');
@@ -2801,6 +2804,8 @@ async function pgRun() {
     document.getElementById('pg-json-req').textContent = JSON.stringify(payload, null, 2);
     document.getElementById('pg-json-res').textContent = JSON.stringify(res.raw, null, 2);
     pushLatencyPoint(res.wall_latency_ms);
+    // Refresh the "Recent" sidebar — the server logged this call.
+    pgHistRefresh();
   } catch (e) {
     errEl.textContent = _pgFormatError(e);
     errEl.classList.remove('hidden');
@@ -2956,6 +2961,153 @@ function pgStopStream() {
     try { _pgStreamCtl.abort(); }
     catch (_) {}
     _pgStreamCtl = null;
+  }
+}
+
+/* ----- Recent predictions sidebar ----- */
+
+/**
+ * Returns the currently-connected server id (for managed servers) or
+ * the raw connect URL (external). Used to filter history.
+ */
+function _pgCurrentServerKey() {
+  const url = document.getElementById('pg-url')?.value.trim();
+  if (!url) return null;
+  return _pgManagedId(url) || url;
+}
+
+async function pgHistRefresh() {
+  const key = _pgCurrentServerKey();
+  if (!key) return;
+  const list  = document.getElementById('pg-hist-list');
+  const empty = document.getElementById('pg-hist-empty');
+  if (!list || !empty) return;
+  try {
+    const params = new URLSearchParams();
+    // Only filter by server_id for managed servers — external connect
+    // URLs aren't unique keys (port + host can repeat across runs).
+    if (_pgManagedId(document.getElementById('pg-url').value.trim())) {
+      params.set('server_id', key);
+    }
+    params.set('limit', '50');
+    const rows = await api(`/api/predict/history?${params.toString()}`);
+    if (!rows.length) {
+      list.classList.add('hidden');
+      empty.classList.remove('hidden');
+      return;
+    }
+    empty.classList.add('hidden');
+    list.classList.remove('hidden');
+    list.innerHTML = rows.map(_pgHistRow).join('');
+  } catch (e) {
+    empty.textContent = 'Could not load history: ' + (e.message || e);
+  }
+}
+
+function _pgHistRow(r) {
+  // Build a short summary string: the response's first prediction's
+  // class_name, or a placeholder when generated text is empty.
+  const preds = (r.response && r.response.predictions) || [];
+  const top = preds[0] || {};
+  const label = top.class_name || top.label || '(no result)';
+  const labelShort = String(label).length > 60
+    ? String(label).slice(0, 57) + '…'
+    : String(label);
+  const ts = (r.created_at || '').replace('T', ' ').slice(0, 19);
+  const kind = r.result_kind || 'logits';
+  const lat = r.latency_ms != null ? `${Number(r.latency_ms).toFixed(0)} ms` : '—';
+
+  // Distinguish input modality with a small emoji prefix so users can
+  // scan the list without reading every row.
+  const req = r.request || {};
+  const modIcon =
+      req.audio_b64 ? '🎵 '
+    : req.video_b64 ? '🎬 '
+    : req.image_b64 ? '🖼️ '
+    : (req.messages && req.messages.length) ? '💬 '
+    : '';
+
+  return `
+    <div class="hist-row" onclick="pgHistReplay(${r.id})"
+         style="display:flex;justify-content:space-between;gap:8px;padding:6px 8px;border:1px solid var(--border);border-radius:6px;cursor:pointer;background:var(--bg-elev)">
+      <div style="min-width:0;flex:1">
+        <div class="text-xs" style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
+          ${modIcon}${escapeHtml(labelShort)}
+        </div>
+        <div class="text-xs text-faint">
+          <span class="badge b-muted">${escapeHtml(kind)}</span>
+          <span class="ml-1">${lat}</span>
+          <span class="text-faint" style="margin-left:6px">${escapeHtml(ts)}</span>
+        </div>
+      </div>
+      <button class="btn btn-icon btn-ghost btn-xs" onclick="event.stopPropagation();pgHistDelete(${r.id})" title="Forget this row">✕</button>
+    </div>`;
+}
+
+async function pgHistReplay(id) {
+  // Fetch the row from the cache rendered above (the bulk list is
+  // already in memory) — simplest is to re-fetch by id, but the list
+  // endpoint already returned the row we need. Re-pull to be safe.
+  try {
+    const rows = await api(`/api/predict/history?limit=200`);
+    const row = rows.find(r => r.id === id);
+    if (!row) {
+      toast('History entry not found', 'error', 3000);
+      return;
+    }
+    const req = row.request || {};
+    // Reset the universal panel and re-apply text-shaped fields. We
+    // intentionally don't re-attach b64 blobs (they were stripped on
+    // storage); the user can re-drop the file if they want a true rerun.
+    const set = (id, v) => {
+      const el = document.getElementById(id);
+      if (el) el.value = v ?? '';
+    };
+    set('pg-text', req.text);
+    set('pg-context', req.context);
+    set('pg-labels', (req.candidate_labels || []).join(', '));
+    set('pg-gen-max', req.max_new_tokens);
+    set('pg-gen-temp', req.temperature);
+    const samp = document.getElementById('pg-gen-sample');
+    if (samp && req.do_sample != null) samp.checked = !!req.do_sample;
+    // Note when a binary attachment is required to re-run accurately.
+    const had = (req.audio_b64 || '').startsWith('<stripped:') ? 'audio'
+              : (req.video_b64 || '').startsWith('<stripped:') ? 'video'
+              : (req.image_b64 || '').startsWith('<stripped:') ? 'image'
+              : null;
+    if (had) {
+      toast(`Loaded text fields. Re-attach an ${had} file to rerun exactly.`,
+             'warn', 5000);
+    } else {
+      toast('Replay loaded — edit and Run.', 'success', 2500);
+    }
+  } catch (e) {
+    toast('Replay failed: ' + (e.message || e), 'error', 4000);
+  }
+}
+
+async function pgHistDelete(id) {
+  try {
+    await api(`/api/predict/history/${id}`, { method: 'DELETE' });
+    pgHistRefresh();
+  } catch (e) {
+    toast('Delete failed: ' + (e.message || e), 'error', 3000);
+  }
+}
+
+async function pgHistClear() {
+  if (!confirm('Clear history for this server?')) return;
+  const key = _pgCurrentServerKey();
+  if (!key) return;
+  try {
+    const params = new URLSearchParams();
+    if (_pgManagedId(document.getElementById('pg-url').value.trim())) {
+      params.set('server_id', key);
+    }
+    await api(`/api/predict/history?${params.toString()}`, { method: 'DELETE' });
+    pgHistRefresh();
+  } catch (e) {
+    toast('Clear failed: ' + (e.message || e), 'error', 3000);
   }
 }
 
@@ -3123,6 +3275,9 @@ async function pgChatSend() {
   } finally {
     if (stopBtn) stopBtn.classList.add('hidden');
     _pgStreamCtl = null;
+    // Refresh the Recent sidebar — the chat turn was logged server-side
+    // by the streaming proxy.
+    pgHistRefresh();
   }
 }
 

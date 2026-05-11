@@ -1830,6 +1830,20 @@ def create_dashboard_app(output_dir: str = "runs") -> FastAPI:
 
         normalized = _normalize_predict_response(raw)
         normalized["wall_latency_ms"] = round(wall_ms, 1)
+        # Record the prediction in history. Best-effort — a logging hiccup
+        # never blocks the predict response. Server metadata (name, task)
+        # is read off the inference manager so the sidebar can group rows.
+        try:
+            info = inference_mgr.get(server_id)
+            tracker().record_prediction(
+                server_id=server_id,
+                request=body,
+                response=normalized,
+                server_name=getattr(info, "name", None),
+                pipeline_task=getattr(info, "model_id", None) or None,
+            )
+        except Exception:
+            pass
         return normalized
 
     @app.post("/api/inference/{server_id}/predict/stream", tags=["Inference"],
@@ -1862,16 +1876,103 @@ def create_dashboard_app(output_dir: str = "runs") -> FastAPI:
             raise HTTPException(502, str(exc))
 
         async def relay():
+            # Sniff the SSE stream for the final 'done' event so we can
+            # record the assembled prediction in history. The tee is
+            # cheap — bytes are forwarded unchanged to the browser AND
+            # buffered locally just enough to extract the done payload.
+            buf = b""
+            done_payload: Optional[dict] = None
             async for chunk in agen:
                 if await request.is_disconnected():
                     break
                 yield chunk
+                # Look for `event: done\ndata: <json>\n\n` in the buffered chunks.
+                buf += chunk
+                if len(buf) > 64_000:
+                    buf = buf[-32_000:]   # keep the tail; final event is small
+                if b"event: done" in buf and b"\n\n" in buf:
+                    try:
+                        text = buf.decode("utf-8", "replace")
+                        last_done = text.rsplit("event: done", 1)[-1]
+                        line = last_done.split("data:", 1)[-1].split("\n\n", 1)[0].strip()
+                        if line:
+                            done_payload = json.loads(line)
+                    except Exception:
+                        done_payload = None
+            # After the stream closes, record what we have. The streamed
+            # response shape is { text, latency_ms, result_kind } —
+            # convert to the same predictions[] shape /predict uses so
+            # the sidebar can render and replay uniformly.
+            if done_payload:
+                try:
+                    info = inference_mgr.get(server_id)
+                    response_shim = {
+                        "predictions": [[{
+                            "label": 0,
+                            "class_name": done_payload.get("text"),
+                            "probability": None,
+                            "score": None,
+                            "metadata": None,
+                        }]],
+                        "result_kind": done_payload.get("result_kind", "generated_text"),
+                        "latency_ms": done_payload.get("latency_ms"),
+                        "model_type": "hf_pipeline",
+                    }
+                    tracker().record_prediction(
+                        server_id=server_id,
+                        request=body,
+                        response=response_shim,
+                        server_name=getattr(info, "name", None),
+                        pipeline_task=getattr(info, "model_id", None) or None,
+                    )
+                except Exception:
+                    pass
 
         return _SSE(relay(), media_type="text/event-stream", headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
         })
+
+    # ------------------------------------------------------------------
+    # Predict history — per-server call log + replay sidebar
+    # ------------------------------------------------------------------
+
+    @app.get("/api/predict/history", tags=["Inference"],
+             summary="Recent predictions (optionally filtered by server)")
+    async def predict_history(server_id: Optional[str] = None,
+                                limit: int = 50):
+        """List recent predictions, newest first.
+
+        ``server_id`` (optional) filters to one managed server — the
+        Predict tab's sidebar calls this with the currently-connected
+        server's id so users only see relevant history.
+
+        The DB stores trimmed request / response bodies (audio_b64,
+        video_b64, and any embedded depth/mask PNG larger than 32 KB
+        are replaced with size-only placeholders). Small image_b64
+        previews are kept so image-classification replays still show
+        a thumbnail.
+        """
+        limit = max(1, min(int(limit), 500))
+        try:
+            return tracker().list_predictions(server_id=server_id, limit=limit)
+        except Exception as exc:
+            raise HTTPException(500, f"Could not read history: {exc}")
+
+    @app.delete("/api/predict/history/{prediction_id}", tags=["Inference"],
+                  summary="Delete one history entry")
+    async def predict_history_delete(prediction_id: int):
+        ok = tracker().delete_prediction(prediction_id)
+        if not ok:
+            raise HTTPException(404, f"No history entry with id {prediction_id}")
+        return {"deleted": True, "id": prediction_id}
+
+    @app.delete("/api/predict/history", tags=["Inference"],
+                  summary="Clear history (all, or filtered by server)")
+    async def predict_history_clear(server_id: Optional[str] = None):
+        count = tracker().clear_predictions(server_id=server_id)
+        return {"cleared": count, "server_id": server_id}
 
     @app.get("/api/inference/{server_id}/info", tags=["Inference"],
              summary="Proxy /info from a managed inference server")

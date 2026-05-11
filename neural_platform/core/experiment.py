@@ -82,6 +82,34 @@ class ExperimentTracker:
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_metrics_run ON metrics(run_id, epoch);
+
+                -- Predict history: per managed-inference-server call log.
+                -- One row per successful /predict (or /predict/stream "done"
+                -- event). Drives the Predict tab's "Recent" sidebar.
+                -- request_json:   the body sent to the inference server,
+                --                 with large b64 fields replaced by placeholders
+                --                 (see _shrink_predict_request).
+                -- response_json:  predictions array + result_kind + the
+                --                 metadata the renderer needs to replay.
+                --                 Large embedded PNGs are dropped.
+                -- latency_ms:     wall-clock latency measured at proxy time.
+                -- result_kind:    duplicated from response_json for cheap WHERE.
+                CREATE TABLE IF NOT EXISTS predict_history (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    server_id     TEXT NOT NULL,
+                    server_url    TEXT,
+                    server_name   TEXT,
+                    pipeline_task TEXT,
+                    request_json  TEXT NOT NULL,
+                    response_json TEXT,
+                    result_kind   TEXT,
+                    latency_ms    REAL,
+                    created_at    TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_predict_server
+                    ON predict_history(server_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_predict_created
+                    ON predict_history(created_at DESC);
             """)
 
     # ------------------------------------------------------------------
@@ -319,3 +347,211 @@ class ExperimentTracker:
                 d["metrics"] = json.loads(d.pop("metrics_json"))
                 result.append(d)
             return result
+
+    # ------------------------------------------------------------------
+    # Predict history
+    # ------------------------------------------------------------------
+    # The dashboard's predict proxy calls record_prediction() after every
+    # successful round-trip so users can browse + replay recent calls per
+    # managed server. Heavy fields (audio_b64, video_b64, depth/mask PNG
+    # thumbnails) are stripped before storage so the DB doesn't bloat at
+    # a few MB per call — we keep enough to render a sidebar row and
+    # repopulate the universal input fields.
+
+    # Cap on string size for any request/response field we persist. 32 KB
+    # is comfortable for text + tokens + small image previews, but rejects
+    # multi-MB audio / video / depth-map blobs.
+    _PREDICT_BLOB_CAP = 32 * 1024
+
+    @staticmethod
+    def _shrink_predict_request(req: Dict[str, Any]) -> Dict[str, Any]:
+        """Strip / truncate fields that would bloat the DB.
+
+        Audio / video b64 blobs and embedded PNG thumbnails are replaced
+        with sentinel ``"<stripped:audio_b64 N bytes>"`` strings — the
+        sidebar shows that an audio file was sent without storing
+        megabytes per row. Small image previews (<32 KB) are kept so
+        image-classification replays still surface a thumbnail.
+        """
+        if not isinstance(req, dict):
+            return {}
+        out: Dict[str, Any] = {}
+        cap = ExperimentTracker._PREDICT_BLOB_CAP
+        for k, v in req.items():
+            if k in ("audio_b64", "video_b64"):
+                if isinstance(v, str) and v:
+                    out[k] = f"<stripped:{k} {len(v)} bytes>"
+                else:
+                    out[k] = None
+                continue
+            if k == "image_b64":
+                if isinstance(v, str) and len(v) > cap:
+                    out[k] = f"<stripped:{k} {len(v)} bytes>"
+                else:
+                    out[k] = v
+                continue
+            # `messages` may carry image / audio parts — recurse one level.
+            if k == "messages" and isinstance(v, list):
+                out[k] = [
+                    ExperimentTracker._shrink_message(m) for m in v
+                ]
+                continue
+            # Anything else: keep the value verbatim. Generic large
+            # strings get a length-only sentinel.
+            if isinstance(v, str) and len(v) > cap:
+                out[k] = f"<stripped:{k} {len(v)} bytes>"
+            else:
+                out[k] = v
+        return out
+
+    @staticmethod
+    def _shrink_message(m: Any) -> Any:
+        """Strip image_b64 / audio_b64 from a ChatMessage dict."""
+        if not isinstance(m, dict):
+            return m
+        out = dict(m)
+        content = out.get("content")
+        if isinstance(content, list):
+            new_parts = []
+            for part in content:
+                if not isinstance(part, dict):
+                    new_parts.append(part)
+                    continue
+                p2 = dict(part)
+                for key in ("image_b64", "audio_b64"):
+                    if isinstance(p2.get(key), str) and p2[key]:
+                        p2[key] = f"<stripped:{key} {len(p2[key])} bytes>"
+                new_parts.append(p2)
+            out["content"] = new_parts
+        return out
+
+    @staticmethod
+    def _shrink_predict_response(resp: Dict[str, Any]) -> Dict[str, Any]:
+        """Strip the heavy parts of a response — embedded depth/mask
+        PNGs in metadata blow past 100 KB / row. We keep the label,
+        probability, and shape info so the sidebar can render a summary
+        and replay the request."""
+        if not isinstance(resp, dict):
+            return {}
+        cap = ExperimentTracker._PREDICT_BLOB_CAP
+        out = {
+            "predictions": [],
+            "result_kind": resp.get("result_kind", "logits"),
+            "latency_ms": resp.get("latency_ms"),
+            "wall_latency_ms": resp.get("wall_latency_ms"),
+            "model_type": resp.get("model_type"),
+        }
+        preds = resp.get("predictions") or []
+        # Flatten the optional nested-list shape, take up to 10 entries.
+        flat: List[Dict[str, Any]] = []
+        if preds and isinstance(preds[0], list):
+            flat = preds[0]
+        elif isinstance(preds, list):
+            flat = preds
+        for p in flat[:10]:
+            if not isinstance(p, dict):
+                continue
+            md = (p.get("metadata") or {}).copy() if isinstance(p.get("metadata"), dict) else None
+            if md is not None:
+                for key in ("image_b64",):   # depth/mask thumbnails
+                    if isinstance(md.get(key), str) and len(md[key]) > cap:
+                        md[key] = f"<stripped:{key} {len(md[key])} bytes>"
+            out["predictions"].append({
+                "label": p.get("label"),
+                "class_name": p.get("class_name"),
+                "probability": p.get("probability"),
+                "score": p.get("score"),
+                "metadata": md,
+            })
+        return out
+
+    def record_prediction(
+        self,
+        server_id: str,
+        request: Dict[str, Any],
+        response: Dict[str, Any],
+        *,
+        server_url: Optional[str] = None,
+        server_name: Optional[str] = None,
+        pipeline_task: Optional[str] = None,
+    ) -> int:
+        """Persist a single predict round-trip to the history table.
+
+        Idempotent in that it always inserts a new row — call sites
+        run after the proxy has confirmed a successful response, so
+        we never log 4xx/5xx as a "successful" prediction. The shrink
+        helpers cap stored size so a session with 50 audio predicts
+        doesn't bloat the DB past a few hundred KB.
+        """
+        now = datetime.utcnow().isoformat()
+        req_min = self._shrink_predict_request(request or {})
+        resp_min = self._shrink_predict_response(response or {})
+        result_kind = resp_min.get("result_kind") or "logits"
+        latency_ms = resp_min.get("latency_ms") or resp_min.get("wall_latency_ms")
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO predict_history "
+                "(server_id, server_url, server_name, pipeline_task, "
+                " request_json, response_json, result_kind, latency_ms, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (server_id, server_url, server_name, pipeline_task,
+                 json.dumps(req_min, default=str), json.dumps(resp_min, default=str),
+                 result_kind, latency_ms, now),
+            )
+            return cur.lastrowid
+
+    def list_predictions(self,
+                          server_id: Optional[str] = None,
+                          *, limit: int = 50) -> List[Dict[str, Any]]:
+        """Return the most recent predictions, newest first.
+
+        Optionally filter by ``server_id`` so the Predict tab only sees
+        the history for the currently-connected managed server. ``limit``
+        caps the response — the sidebar shows the latest 50 by default,
+        which is plenty for a session and keeps the JSON payload small.
+        """
+        sql = "SELECT * FROM predict_history"
+        params: List[Any] = []
+        if server_id:
+            sql += " WHERE server_id = ?"
+            params.append(server_id)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(int(limit))
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["request"] = json.loads(d.pop("request_json") or "{}")
+            except Exception:
+                d["request"] = {}
+            try:
+                d["response"] = json.loads(d.pop("response_json") or "{}")
+            except Exception:
+                d["response"] = {}
+            out.append(d)
+        return out
+
+    def delete_prediction(self, prediction_id: int) -> bool:
+        """Remove one entry — supports the per-row ✕ button in the
+        sidebar."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM predict_history WHERE id = ?", (prediction_id,),
+            )
+            return cur.rowcount > 0
+
+    def clear_predictions(self, server_id: Optional[str] = None) -> int:
+        """Clear history. With no ``server_id``, drops everything (the
+        "Clear all" button); with a server_id, drops just that server's
+        rows (the per-server "Clear history" button)."""
+        with self._connect() as conn:
+            if server_id:
+                cur = conn.execute(
+                    "DELETE FROM predict_history WHERE server_id = ?",
+                    (server_id,),
+                )
+            else:
+                cur = conn.execute("DELETE FROM predict_history")
+            return cur.rowcount
