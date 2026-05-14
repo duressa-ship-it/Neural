@@ -209,7 +209,10 @@ class InferenceServerManager:
                       *,
                       name: Optional[str] = None,
                       revision: Optional[str] = None,
-                      trust_remote_code: bool = False) -> ServerInfo:
+                      trust_remote_code: bool = False,
+                      load_in_4bit: bool = False,
+                      load_in_8bit: bool = False,
+                      bnb_compute_dtype: Optional[str] = None) -> ServerInfo:
         """Spawn an inference server backed by a HuggingFace model id.
 
         Synthesizes a minimal ``ExperimentConfig`` (model.type=hf_pipeline,
@@ -253,6 +256,9 @@ class InferenceServerManager:
             revision=revision,
             trust_remote_code=trust_remote_code,
             display_name=name,
+            load_in_4bit=load_in_4bit,
+            load_in_8bit=load_in_8bit,
+            bnb_compute_dtype=bnb_compute_dtype,
         )
         cfg_path = run_dir / "config.yaml"
 
@@ -632,6 +638,9 @@ def _synthesize_hf_config(
     revision: Optional[str] = None,
     trust_remote_code: bool = False,
     display_name: Optional[str] = None,
+    load_in_4bit: bool = False,
+    load_in_8bit: bool = False,
+    bnb_compute_dtype: Optional[str] = None,
 ):
     """Build a minimal ExperimentConfig + write it to a private run dir.
 
@@ -699,6 +708,9 @@ def _synthesize_hf_config(
                 pretrained=hf_model_id,
                 revision=revision,
                 trust_remote_code=trust_remote_code,
+                load_in_4bit=load_in_4bit,
+                load_in_8bit=load_in_8bit,
+                bnb_compute_dtype=bnb_compute_dtype,
             ),
         ),
         training=TrainingConfig(

@@ -235,6 +235,54 @@ class HFPipelineConfig(BaseModel):
     freeze_backbone: bool = Field(False, description="Freeze encoder weights and train only the head")
     revision: Optional[str] = Field(None, description="HuggingFace model revision / git ref")
     trust_remote_code: bool = Field(False, description="Some HF models require this flag to load custom architectures")
+    # ------- Quantization (bitsandbytes) -------------------------------
+    # Quantized loading dramatically reduces VRAM at a small accuracy
+    # cost. 4-bit fits Gemma-3-4B / Qwen2-VL-7B on a consumer 8-GB card;
+    # 8-bit is a milder reduction with better quality. Both require the
+    # `bitsandbytes` package (NeuralForge's `[quantization]` extra).
+    # The wrapper auto-picks `device_map='auto'` when either is set so
+    # quantized weights land on the GPU.
+    load_in_4bit: bool = Field(
+        False,
+        description=(
+            "Load the model with 4-bit weights (nf4 by default via "
+            "bitsandbytes). Cuts VRAM ~8x vs fp32; needed for 7B+ "
+            "models on consumer GPUs. Mutually exclusive with "
+            "load_in_8bit."
+        ),
+    )
+    load_in_8bit: bool = Field(
+        False,
+        description=(
+            "Load the model with 8-bit weights via bitsandbytes. "
+            "Cuts VRAM ~4x vs fp32 with minimal accuracy loss."
+        ),
+    )
+    bnb_compute_dtype: Optional[str] = Field(
+        None,
+        description=(
+            "Compute dtype for quantized layers — 'float16' / 'bfloat16' "
+            "/ 'float32'. Defaults to bfloat16 when a CUDA GPU with "
+            "Ampere+ is present, float16 otherwise. Ignored when neither "
+            "load_in_4bit nor load_in_8bit is set."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check_quantization(self) -> HFPipelineConfig:
+        if self.load_in_4bit and self.load_in_8bit:
+            raise ValueError(
+                "model.hf_pipeline.load_in_4bit and load_in_8bit are "
+                "mutually exclusive — pick one."
+            )
+        if self.bnb_compute_dtype is not None:
+            allowed = {"float16", "bfloat16", "float32"}
+            if self.bnb_compute_dtype.lower() not in allowed:
+                raise ValueError(
+                    f"bnb_compute_dtype must be one of {sorted(allowed)}; "
+                    f"got {self.bnb_compute_dtype!r}."
+                )
+        return self
 
 
 class VideoCNNConfig(BaseModel):

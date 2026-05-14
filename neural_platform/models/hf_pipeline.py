@@ -131,6 +131,55 @@ class HFPipelineModel(BaseModel):
         if arch.trust_remote_code:  load_kwargs["trust_remote_code"] = True
         if arch.output_size and arch.output_size > 0 and "Classification" in auto_name:
             load_kwargs["num_labels"] = arch.output_size
+
+        # ----- Quantization -----------------------------------------------
+        # If either 4-bit or 8-bit is requested, build a
+        # BitsAndBytesConfig and request device_map='auto' so the
+        # quantized weights land on the GPU. We don't silently fall
+        # back when bitsandbytes is missing — that would surprise the
+        # user with full-precision weights when they specifically asked
+        # for 4-bit on a 7B model that doesn't fit.
+        if getattr(arch, "load_in_4bit", False) or getattr(arch, "load_in_8bit", False):
+            try:
+                from transformers import BitsAndBytesConfig   # type: ignore
+            except ImportError as exc:
+                raise ImportError(
+                    "Quantized loading requires `transformers` >= 4.30. "
+                    "Update via the `[hf]` extra."
+                ) from exc
+            try:
+                import bitsandbytes  # type: ignore  # noqa: F401
+            except ImportError as exc:
+                raise ImportError(
+                    "Quantized loading needs the `bitsandbytes` package. "
+                    "Install via `pip install -e .[quantization]` (or "
+                    "`pip install bitsandbytes`). Note: bitsandbytes "
+                    "requires a CUDA GPU; on Apple Silicon / CPU-only "
+                    "machines drop the load_in_4bit / load_in_8bit flags."
+                ) from exc
+            dtype_str = (arch.bnb_compute_dtype or "bfloat16").lower()
+            dtype_map = {
+                "float16":  torch.float16,
+                "bfloat16": torch.bfloat16,
+                "float32":  torch.float32,
+            }
+            compute_dtype = dtype_map.get(dtype_str, torch.float16)
+            bnb_kwargs: Dict[str, Any] = {}
+            if arch.load_in_4bit:
+                bnb_kwargs["load_in_4bit"]          = True
+                bnb_kwargs["bnb_4bit_compute_dtype"] = compute_dtype
+                # nf4 is the de-facto default for the QLoRA workflow;
+                # quality beats fp4 in most published comparisons.
+                bnb_kwargs["bnb_4bit_quant_type"]   = "nf4"
+                bnb_kwargs["bnb_4bit_use_double_quant"] = True
+            else:
+                bnb_kwargs["load_in_8bit"] = True
+            load_kwargs["quantization_config"] = BitsAndBytesConfig(**bnb_kwargs)
+            # device_map='auto' is what HF expects alongside a
+            # quantization_config — without it, the model would try to
+            # land on CPU and the kernels would refuse to run.
+            load_kwargs.setdefault("device_map", "auto")
+        # ------------------------------------------------------------------
         # Pass the discovered HF token through `transformers` so gated repos
         # work without the user having to plumb auth themselves. We resolve
         # it from `core.hf_auth` (env or huggingface-cli cache) and only at

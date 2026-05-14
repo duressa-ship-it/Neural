@@ -2243,6 +2243,15 @@ async function ifOpenLaunch() {
   // Default back to the config tab on each open so the drawer doesn't
   // remember stale state from a prior failed HF launch.
   ifSwitchSource('config');
+  // Reset quantization checkboxes — leaking 4-bit between launches is
+  // a surprise (the user picks a different model + accidentally
+  // quantizes it because the toggle stuck on).
+  ['if-hf-4bit', 'if-hf-8bit', 'if-hf-trust'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.checked = false;
+  });
+  const dt = document.getElementById('if-hf-bnb-dtype');
+  if (dt) dt.value = '';
   // Populate the config dropdown from the existing /api/configs endpoint
   const sel = document.getElementById('if-cfg-select');
   if (sel) {
@@ -2289,6 +2298,17 @@ function ifSwitchSource(src) {
 function ifCloseLaunch() {
   document.getElementById('if-scrim').classList.remove('show');
   document.getElementById('if-drawer').classList.remove('show');
+}
+
+/** Mutual-exclusion for the 4-bit / 8-bit checkboxes in the HF launch
+ * drawer. Toggling one off if the user enables the other so we never
+ * send both flags to the server (which would 422 the launch). */
+function ifSyncQuantization(which) {
+  const b4 = document.getElementById('if-hf-4bit');
+  const b8 = document.getElementById('if-hf-8bit');
+  if (!b4 || !b8) return;
+  if (which === '4bit' && b4.checked) b8.checked = false;
+  else if (which === '8bit' && b8.checked) b4.checked = false;
 }
 
 async function ifInspectHF() {
@@ -2346,11 +2366,25 @@ async function ifLaunch() {
         errEl.classList.remove('hidden');
         return;
       }
+      // Quantization knobs — mutually exclusive between 4-bit / 8-bit;
+      // the Pydantic validator on the server also enforces this, but
+      // we surface the error in the UI before round-tripping.
+      const load4 = document.getElementById('if-hf-4bit')?.checked || false;
+      const load8 = document.getElementById('if-hf-8bit')?.checked || false;
+      const bnbDtype = document.getElementById('if-hf-bnb-dtype')?.value || null;
+      if (load4 && load8) {
+        errEl.textContent = 'load_in_4bit and load_in_8bit are mutually exclusive — pick one.';
+        errEl.classList.remove('hidden');
+        return;
+      }
       info = await apiPost('/api/inference/start_hf', {
         hf_model_id: id,
         pipeline_task: task,
         name,
         trust_remote_code: trust,
+        load_in_4bit: load4,
+        load_in_8bit: load8,
+        bnb_compute_dtype: bnbDtype || null,
       });
     } else {
       // Existing config-driven launch.
@@ -2441,6 +2475,11 @@ async function pgConnect() {
     pgSetStatus('ok', 'Connected');
     document.getElementById('pg-run').disabled = false;
     pgShowInfo(info);
+    // Stash architecture + generation defaults from /info before
+    // applying the UI hint — pgApplyHint reads them to prefill
+    // placeholders on max_new_tokens / temperature and to render the
+    // "Model accepts up to N tokens" subtitle.
+    _pgModelDefaults = info.model_defaults || null;
     // Drive the universal input panel from the server's spec hint.
     // /info now carries a ui_hint dict per the connected model's task —
     // we toggle visibility instead of switching across hardcoded panels.
@@ -2556,6 +2595,71 @@ function pgApplyHint(hint) {
   if (img) { img.src = ''; img.classList.add('hidden'); }
   const fileInfo = document.getElementById('pg-file-info');
   if (fileInfo) { fileInfo.textContent = ''; fileInfo.classList.add('hidden'); }
+
+  // Prefill generation-knob placeholders + length hint from
+  // info.model_defaults. We touch `placeholder`, never `value` — a
+  // user-typed override must not be clobbered when we reconnect.
+  _pgApplyModelDefaults();
+}
+
+/** Apply info.model_defaults to the universal panel: placeholder
+ *  values on generation knobs, and a "model accepts up to N tokens"
+ *  subtitle under the text input when max_position_embeddings is known.
+ */
+function _pgApplyModelDefaults() {
+  const d = _pgModelDefaults || {};
+  const gen = d.generation || {};
+
+  const setPh = (id, v) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.placeholder = (v != null) ? `(default: ${v})` : '(model default)';
+  };
+  setPh('pg-gen-max', gen.max_new_tokens != null ? gen.max_new_tokens : gen.max_length);
+  setPh('pg-gen-temp', gen.temperature);
+
+  // Length hint under the text input. Approximate token count as
+  // chars/4 — wrong for non-English / heavy punctuation but matches
+  // what users see in HF playgrounds, and it's a *hint*, not a hard
+  // gate. Server-side runtime errors stay the source of truth for
+  // overflow detection (different tokenizers, different ratios).
+  const hint = document.getElementById('pg-text-hint');
+  if (hint) {
+    const maxTok = d.max_position_embeddings;
+    if (maxTok && maxTok > 0) {
+      hint.classList.remove('hidden');
+      hint.dataset.maxTokens = String(maxTok);
+      hint.textContent = `Model accepts up to ${maxTok.toLocaleString()} tokens (≈${Math.round(maxTok * 4).toLocaleString()} characters)`;
+      // Re-run length check in case the user already typed before
+      // reconnecting to a smaller-context model.
+      pgValidateLength();
+    } else {
+      hint.classList.add('hidden');
+      hint.textContent = '';
+      delete hint.dataset.maxTokens;
+    }
+  }
+}
+
+/** Soft length warning: when the text input crosses the model's
+ *  approximate token budget, paint the hint amber so the user notices
+ *  before they hit a runtime tokenizer error. Token count is estimated
+ *  via chars/4 — rough but matches HF playground heuristics. */
+function pgValidateLength() {
+  const hint = document.getElementById('pg-text-hint');
+  if (!hint || !hint.dataset.maxTokens) return;
+  const maxTok = parseInt(hint.dataset.maxTokens, 10);
+  if (!maxTok) return;
+  const text = (document.getElementById('pg-text')?.value || '');
+  const ctx  = (document.getElementById('pg-context')?.value || '');
+  const approxTokens = Math.ceil((text.length + ctx.length) / 4);
+  if (approxTokens > maxTok) {
+    hint.textContent = `⚠ Input ≈${approxTokens.toLocaleString()} tokens exceeds the model's ${maxTok.toLocaleString()}-token context. Tokenizer will truncate.`;
+    hint.style.color = 'var(--warning, #f59e0b)';
+  } else {
+    hint.textContent = `Model accepts up to ${maxTok.toLocaleString()} tokens (≈${Math.round(maxTok * 4).toLocaleString()} characters)`;
+    hint.style.color = '';
+  }
 }
 
 /**
@@ -2658,6 +2762,7 @@ let _pgAudioB64 = null;   // base64 of a dropped audio file
 let _pgVideoB64 = null;   // base64 of a dropped video file
 let _pgFileMime = null;   // MIME hint forwarded with the b64 field
 let _pgStreamCtl = null;  // AbortController for an in-flight streaming request
+let _pgModelDefaults = null;   // info.model_defaults — drives prefills + length hint
 
 // Chat-mode state (only used when info.has_chat_template is true).
 // _pgChatMessages is the in-memory transcript; clearing it is "+ New chat".

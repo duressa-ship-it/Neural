@@ -906,6 +906,41 @@ neural init --model transformer --name text_classifier</div>
             <span class="text-xs text-faint">Required for some custom architectures (e.g. Phi, Qwen variants). Off by default.</span>
           </label>
         </div>
+
+        <!--
+          Quantization — bitsandbytes weight loading. Cuts VRAM so
+          Gemma-3-4B / Qwen2-VL-7B fit on consumer 8-GB cards. Mutually
+          exclusive between 4-bit and 8-bit; bnb_compute_dtype is a
+          secondary knob that only matters when one of those is on.
+          The wrapper raises a clear ImportError when bitsandbytes is
+          missing (the [quantization] extra) so users hit that wall at
+          launch time, not predict time.
+        -->
+        <div class="field">
+          <label class="label">Quantization (bitsandbytes)</label>
+          <label class="row-tight" style="cursor:pointer">
+            <input type="checkbox" id="if-hf-4bit" onchange="ifSyncQuantization('4bit')" />
+            <span class="text-xs">load_in_4bit <span class="text-faint">— ~8× VRAM reduction (nf4 + double-quant). Needed for 7B+ models on 8 GB GPUs.</span></span>
+          </label>
+          <label class="row-tight mt-1" style="cursor:pointer">
+            <input type="checkbox" id="if-hf-8bit" onchange="ifSyncQuantization('8bit')" />
+            <span class="text-xs">load_in_8bit <span class="text-faint">— ~4× VRAM reduction, milder accuracy hit.</span></span>
+          </label>
+          <div class="row-tight mt-2">
+            <label class="text-xs text-faint">Compute dtype</label>
+            <select class="select" id="if-hf-bnb-dtype" style="width:140px;padding:3px 6px">
+              <option value="">(auto)</option>
+              <option value="bfloat16">bfloat16</option>
+              <option value="float16">float16</option>
+              <option value="float32">float32</option>
+            </select>
+            <span class="text-xs text-faint">Only used when 4-bit or 8-bit is on.</span>
+          </div>
+          <div class="text-xs text-faint mt-1">
+            Requires the <code>[quantization]</code> extra (CUDA-only;
+            unsupported on Apple Silicon).
+          </div>
+        </div>
       </div>
 
       <div class="field">
@@ -980,13 +1015,19 @@ neural init --model transformer --name text_classifier</div>
           <!-- Text / instruction / question -->
           <div id="pg-text-row" class="field hidden">
             <label class="label" id="pg-text-label">Text</label>
-            <input class="input" id="pg-text" placeholder="Type the input text" />
+            <input class="input" id="pg-text" placeholder="Type the input text"
+                   oninput="pgValidateLength()" />
+            <!-- "Model accepts up to N tokens" + over-limit warning.
+                 Populated by pgApplyHint from info.model_defaults; goes
+                 amber when the user's approximate token count crosses
+                 max_position_embeddings. -->
+            <div id="pg-text-hint" class="text-xs text-faint mt-1 hidden"></div>
           </div>
 
           <!-- QA / text-pair context -->
           <div id="pg-context-row" class="field hidden">
             <label class="label">Context (passage)</label>
-            <textarea class="input" id="pg-context" placeholder="Paste the passage the question should be answered from" style="min-height:80px"></textarea>
+            <textarea class="input" id="pg-context" placeholder="Paste the passage the question should be answered from" style="min-height:80px" oninput="pgValidateLength()"></textarea>
           </div>
 
           <!-- Candidate labels (zero-shot) -->

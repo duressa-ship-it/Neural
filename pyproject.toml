@@ -82,6 +82,12 @@ hf = [
 # train or serve a peft adapter repo.
 peft = ["peft>=0.7.0"]
 
+# Quantization (bitsandbytes) — needed when launching HF models with
+# load_in_4bit / load_in_8bit. CUDA-only on Linux/Windows; not supported
+# on Apple Silicon today, so the wrapper raises a clear error on import
+# failure instead of silently falling back to full-precision.
+quantization = ["bitsandbytes>=0.43.0"]
+
 # Image-modality extras
 vision = ["torchvision>=0.15.0", "timm>=1.0.27"]
 
@@ -95,7 +101,7 @@ audio = [
 ]
 
 # Video-modality extras
-video = ["torchvision>=0.15.0", "av>=10.0.0"]
+video = ["torchvision>=0.15.0", "av>=10.0.0", "ffmpeg>=1.4"]
 
 # Alternative training frameworks (the adapter stubs are present in-tree but
 # the actual frameworks aren't pulled in by default).

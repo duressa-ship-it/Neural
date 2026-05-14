@@ -320,6 +320,19 @@ class InfoResponse(PydanticModel):
             "`unexpected` (skipped) keys. None when load was clean."
         ),
     )
+    model_defaults: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "Architecture + generation defaults read off the loaded HF "
+            "model's `config` and `generation_config`. The Predict tab "
+            "uses these to pre-fill placeholders on the generation "
+            "knobs (max_new_tokens, temperature, …) and to warn when "
+            "input text exceeds max_position_embeddings. Keys missing "
+            "on the model are surfaced as null so the frontend can do "
+            "uniform null-checks. See `_extract_hf_defaults` for the "
+            "exact schema."
+        ),
+    )
     # UI hint dictionary derived from the pipeline_specs table — the
     # Predict tab reads this off /info and renders a single universal
     # input panel whose visible fields adapt to the connected model.
@@ -639,6 +652,21 @@ def create_inference_app(config: ExperimentConfig,
             mtype = config.model.type.value
             ui_hint_dict = _native_ui_hint(mtype)
 
+        # HF architecture + generation defaults — only meaningful for
+        # hf_pipeline servers. Read once at /info time so the Predict
+        # UI can pre-fill placeholders + warn about context-length
+        # overflows. Failures here never block the response — we
+        # surface whatever we got and the frontend tolerates partial
+        # data.
+        model_defaults: Optional[Dict[str, Any]] = None
+        if config.model.type.value == "hf_pipeline":
+            try:
+                model_defaults = _extract_hf_defaults(
+                    model, container.get("processor"),
+                )
+            except Exception:
+                pass
+
         # Pull the HF LOAD REPORT off the wrapper (if any). The wrapper
         # captures transformers' stderr during from_pretrained; we
         # condense the captured dict into a small summary for the UI.
@@ -702,6 +730,7 @@ def create_inference_app(config: ExperimentConfig,
             ui_hint=ui_hint_dict,
             has_chat_template=has_chat_template,
             load_warnings=load_warnings,
+            model_defaults=model_defaults,
         )
 
     @app.get("/info/layers", response_model=LayersResponse, tags=["System"], summary="Per-layer breakdown")
@@ -2167,6 +2196,67 @@ def _native_ui_hint(model_type: str) -> Dict[str, Any]:
             primary_field="inputs",
         )
     return base
+
+
+def _extract_hf_defaults(model, processor) -> Dict[str, Any]:
+    """Pull useful defaults off a loaded HF model + processor.
+
+    Read once at /info time so the Predict UI can pre-fill generation
+    knobs and warn when the user's input is about to exceed the
+    model's context length. Returns a stable dict shape with ``None``
+    placeholders for every key the model didn't expose — keeps the
+    frontend's null-check logic uniform across architectures.
+
+    Sources (in priority order):
+
+      * ``model.encoder.config`` (HF ``PretrainedConfig``) —
+        max_position_embeddings, vocab_size, model_type, num_labels.
+      * ``model.encoder.generation_config`` (HF ``GenerationConfig``,
+        a *separate* object from ``.config``) — temperature, top_p,
+        top_k, num_beams, do_sample, repetition_penalty,
+        max_new_tokens / max_length.
+      * ``processor.feature_extractor`` (audio models) —
+        sampling_rate, feature_size.
+
+    Defensive: every attribute access is wrapped so a model with an
+    unusual config doesn't 500 the /info endpoint. We surface what we
+    can and leave the rest as ``None``.
+    """
+    def _get(obj, name, default=None):
+        try:
+            v = getattr(obj, name, default)
+            return v if v is not None else default
+        except Exception:
+            return default
+
+    encoder = getattr(model, "encoder", model)
+    cfg = _get(encoder, "config")
+    gen_cfg = _get(encoder, "generation_config")
+    feat = _get(processor, "feature_extractor") if processor is not None else None
+
+    # max_position_embeddings is the standard text-model length cap.
+    # Whisper-style speech models use `max_source_positions` instead.
+    max_pos = _get(cfg, "max_position_embeddings")
+    if max_pos is None:
+        max_pos = _get(cfg, "max_source_positions")
+
+    return {
+        "model_type":              _get(cfg, "model_type"),
+        "max_position_embeddings": max_pos,
+        "vocab_size":              _get(cfg, "vocab_size"),
+        "sampling_rate":           _get(feat, "sampling_rate"),
+        "feature_size":            _get(feat, "feature_size"),
+        "generation": {
+            "max_new_tokens":     _get(gen_cfg, "max_new_tokens"),
+            "max_length":         _get(gen_cfg, "max_length"),
+            "temperature":        _get(gen_cfg, "temperature"),
+            "top_p":              _get(gen_cfg, "top_p"),
+            "top_k":              _get(gen_cfg, "top_k"),
+            "num_beams":          _get(gen_cfg, "num_beams"),
+            "do_sample":          _get(gen_cfg, "do_sample"),
+            "repetition_penalty": _get(gen_cfg, "repetition_penalty"),
+        },
+    }
 
 
 def _resolve_target_sample_rate(processor) -> int:

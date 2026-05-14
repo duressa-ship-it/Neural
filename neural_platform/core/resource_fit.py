@@ -163,7 +163,8 @@ def estimate_model_footprint(parameters: Optional[int],
                               hidden_size: Optional[int] = None,
                               num_layers: Optional[int] = None,
                               num_heads: Optional[int] = None,
-                              dtype_bytes: int = 4) -> FitEstimate:
+                              dtype_bytes: int = 4,
+                              quantization_bits: Optional[int] = None) -> FitEstimate:
     """Predict bytes for a particular model + purpose.
 
     `parameters` / `size_bytes` come from the model source's `ModelInfo`.
@@ -173,12 +174,31 @@ def estimate_model_footprint(parameters: Optional[int],
     (large model, modest batch but long sequence, attention-heavy).
 
     `dtype_bytes` defaults to fp32 (4). Pass 2 for fp16 / bf16.
+
+    ``quantization_bits`` (one of 4 or 8) lets the caller request a
+    quantized-weights estimate. The runtime weight size scales with the
+    requested bits, **but activations stay at the original dtype** —
+    bitsandbytes dequantizes on the fly during matmuls. This matches the
+    actual VRAM curve users observe: a 7B model with load_in_4bit fits
+    on an 8GB card mainly because the weight buffer shrunk, not because
+    activations got smaller.
     """
     est = FitEstimate()
     if not parameters and size_bytes:
         parameters = max(1, size_bytes // 4)
     if parameters:
-        est.model_weight_b = parameters * dtype_bytes
+        # Quantized weights: bits/8 bytes per parameter for the weight
+        # buffer; activations and gradients still use dtype_bytes (4
+        # for fp32, 2 for fp16/bf16). Quantization is inference-only —
+        # bitsandbytes doesn't support backprop through 4-bit weights
+        # in any first-class way — so we force purpose='inference'
+        # silently when quantization is on.
+        if quantization_bits in (4, 8):
+            est.model_weight_b = max(1, (parameters * quantization_bits) // 8)
+            if purpose == "training":
+                purpose = "inference"
+        else:
+            est.model_weight_b = parameters * dtype_bytes
         if purpose == "training":
             mult = {
                 "adamw": _TRAIN_OVERHEAD_PER_PARAM_B,

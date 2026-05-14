@@ -123,6 +123,12 @@ class StartHFInferenceRequest(BaseModel):
     name:           Optional[str] = Field(None, description="Display name; defaults to hf:<id>")
     revision:       Optional[str] = Field(None, description="Optional model revision / git ref")
     trust_remote_code: bool = Field(False, description="Pass trust_remote_code=True to from_pretrained — required for some custom HF repos")
+    # Quantization knobs — forwarded into the synthesized HFPipelineConfig.
+    # These reduce VRAM at a small accuracy cost. The wrapper raises a clear
+    # error if `bitsandbytes` isn't installed.
+    load_in_4bit: bool = Field(False, description="Load with 4-bit weights via bitsandbytes — needed for 7B+ models on consumer GPUs.")
+    load_in_8bit: bool = Field(False, description="Load with 8-bit weights via bitsandbytes — milder VRAM reduction with better accuracy.")
+    bnb_compute_dtype: Optional[str] = Field(None, description="Compute dtype for quantized layers: 'float16' / 'bfloat16' / 'float32'.")
 
 
 class SaveConfigRequest(BaseModel):
@@ -1777,6 +1783,9 @@ def create_dashboard_app(output_dir: str = "runs") -> FastAPI:
                 name=req.name,
                 revision=req.revision,
                 trust_remote_code=req.trust_remote_code,
+                load_in_4bit=req.load_in_4bit,
+                load_in_8bit=req.load_in_8bit,
+                bnb_compute_dtype=req.bnb_compute_dtype,
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc))
