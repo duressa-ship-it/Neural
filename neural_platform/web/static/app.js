@@ -1002,9 +1002,196 @@ function initLiveCharts() { ['ch-batch', 'ch-epoch', 'ch-acc'].forEach(destroyCh
 /* BUILDER */
 let bMtype = 'mlp';
 let bWired = false;
+/* ============================================================
+ * Schema-driven Builder (β) — opt-in alternative to the legacy
+ * per-family panels. Driven by /api/configs/schema +
+ * form_builder.js. Toggle via ?builder=schema in the URL or the
+ * button at the top of the Builder tab.
+ * ============================================================ */
+
+let _bSchemaHandle = null;         // form_builder render handle
+let _bSchemaDescriptor = null;     // cached /api/configs/schema response
+let _bSchemaConfig = {};           // current edited config
+
+/** Flip between the legacy hand-rolled Builder and the schema-
+ * driven view. Persists the choice on `window.location` so a
+ * refresh keeps it. */
+function bToggleBuilder(which) {
+  const legacy = document.getElementById('b-legacy-root');
+  const schema = document.getElementById('b-schema-root');
+  const tLegacy = document.getElementById('b-toggle-legacy');
+  const tSchema = document.getElementById('b-toggle-schema');
+  const useSchema = which === 'schema';
+  if (legacy) legacy.classList.toggle('hidden', useSchema);
+  if (schema) schema.classList.toggle('hidden', !useSchema);
+  if (tLegacy) tLegacy.className = useSchema ? 'btn btn-ghost btn-xs' : 'btn btn-secondary btn-xs';
+  if (tSchema) tSchema.className = useSchema ? 'btn btn-secondary btn-xs' : 'btn btn-ghost btn-xs';
+  // Mirror to the URL so refreshes stick.
+  try {
+    const url = new URL(window.location.href);
+    if (useSchema) url.searchParams.set('builder', 'schema');
+    else           url.searchParams.delete('builder');
+    window.history.replaceState({}, '', url);
+  } catch (_) {}
+  if (useSchema && !_bSchemaHandle) bSchemaRender();
+}
+
+/** Fetch /api/configs/schema, mount form_builder.js, wire the
+ * onChange callback to refresh the YAML preview live. */
+async function bSchemaRender() {
+  const host = document.getElementById('b-schema-host');
+  const status = document.getElementById('b-schema-yaml-status');
+  if (!host) return;
+  host.innerHTML = '<div class="text-xs text-faint">Loading schema…</div>';
+  if (status) status.textContent = 'fetching schema…';
+  try {
+    if (!_bSchemaDescriptor) {
+      _bSchemaDescriptor = await api('/api/configs/schema');
+    }
+  } catch (e) {
+    host.innerHTML = `<div class="text-xs" style="color:var(--danger)">Schema fetch failed: ${escapeHtml(e.message || String(e))}</div>`;
+    return;
+  }
+  // Seed config with the model_type tab's currently-selected value
+  // so the visible_when discriminator kicks in on first render.
+  if (!_bSchemaConfig.model) _bSchemaConfig.model = { type: 'mlp' };
+  _bSchemaHandle = NF_FORM.render({
+    host,
+    descriptor:    _bSchemaDescriptor,
+    initialConfig: _bSchemaConfig,
+    onChange: (path, value, cfg) => {
+      _bSchemaConfig = cfg;
+      _bSchemaRenderYaml();
+    },
+    // Per-section cross-field hooks. Each gets the group's DOM node
+    // and the form-builder state — we use it for HF Pipeline's
+    // 4-bit/8-bit mutual exclusion (Pydantic enforces it too, but
+    // surfacing it client-side avoids round-tripping a 422).
+    hooks: _bSchemaHooks(),
+  });
+  if (status) status.textContent = '';
+  _bSchemaRenderYaml();
+}
+
+/** Hooks for sections that need cross-field behavior beyond what
+ * the generic renderer provides. Each function receives the
+ * group's DOM container; it can attach extra event listeners. */
+function _bSchemaHooks() {
+  return {
+    // HF Pipeline: 4-bit and 8-bit checkboxes are mutually
+    // exclusive. The Pydantic validator catches it on save, but
+    // toggling client-side is friendlier.
+    'model.hf_pipeline': (node) => {
+      const find = (path) => node.querySelector(`.nf-field[data-path="${path}"] input[type="checkbox"]`);
+      const b4 = find('model.hf_pipeline.load_in_4bit');
+      const b8 = find('model.hf_pipeline.load_in_8bit');
+      if (b4 && b8) {
+        b4.addEventListener('change', () => { if (b4.checked) b8.checked = false; });
+        b8.addEventListener('change', () => { if (b8.checked) b4.checked = false; });
+      }
+    },
+  };
+}
+
+/** Serialize the current config to YAML in the side pane. Uses a
+ * tiny inline emitter — adequate for the preview; the server's
+ * /api/configs/save accepts the JSON shape directly so we don't
+ * need a JS YAML library. */
+function _bSchemaRenderYaml() {
+  const out = document.getElementById('b-schema-yaml');
+  if (!out) return;
+  out.textContent = _toYaml(_bSchemaConfig);
+}
+
+/** Minimal JSON→YAML emitter. Handles strings/numbers/booleans/
+ * lists/dicts/nulls — everything Pydantic emits. Not a general
+ * YAML library; only used for the preview pane. */
+function _toYaml(obj, indent) {
+  indent = indent || 0;
+  const pad = '  '.repeat(indent);
+  if (obj === null || obj === undefined) return 'null';
+  if (typeof obj === 'string') {
+    // Quote strings with special chars; bare strings otherwise.
+    return /[:#&*!|>'"%@`,\[\]{}\n]/.test(obj) || obj === '' ? JSON.stringify(obj) : obj;
+  }
+  if (typeof obj === 'number' || typeof obj === 'boolean') return String(obj);
+  if (Array.isArray(obj)) {
+    if (!obj.length) return '[]';
+    return obj.map(v => {
+      const rendered = _toYaml(v, indent + 1);
+      // Inline scalars; block-render dicts/lists.
+      if (typeof v === 'object' && v !== null) {
+        return `${pad}-\n${rendered.split('\n').map(l => '  ' + l).join('\n')}`;
+      }
+      return `${pad}- ${rendered}`;
+    }).join('\n');
+  }
+  if (typeof obj === 'object') {
+    const keys = Object.keys(obj);
+    if (!keys.length) return '{}';
+    return keys.map(k => {
+      const v = obj[k];
+      if (v === null || typeof v !== 'object' || (Array.isArray(v) && !v.length)) {
+        return `${pad}${k}: ${_toYaml(v, indent + 1)}`;
+      }
+      return `${pad}${k}:\n${_toYaml(v, indent + 1)}`;
+    }).join('\n');
+  }
+  return String(obj);
+}
+
+/** Save the assembled config via /api/configs/save. Surfaces
+ * Pydantic validation errors inline. */
+async function bSchemaSave() {
+  const valEl = document.getElementById('b-schema-validation');
+  const saveBtn = document.getElementById('b-schema-save');
+  if (valEl) valEl.innerHTML = '<span class="text-faint">Validating…</span>';
+  if (saveBtn) saveBtn.disabled = true;
+  try {
+    const name = _bSchemaConfig.name;
+    if (!name) {
+      throw new Error('Set an experiment name first (top of the form).');
+    }
+    // /api/configs/save accepts {name, config, overwrite}. Server
+    // runs the same Pydantic validator the CLI uses.
+    const res = await apiPost('/api/configs/save', {
+      name,
+      config: _bSchemaConfig,
+      overwrite: true,
+    });
+    if (valEl) {
+      valEl.innerHTML = `<span style="color:var(--success)">✓ Saved to ${escapeHtml(res.path || name)}</span>`;
+    }
+    toast('Config saved', 'success', 3000);
+  } catch (e) {
+    if (valEl) {
+      valEl.innerHTML = `<span style="color:var(--danger)">${escapeHtml(_pgFormatError(e))}</span>`;
+    }
+    toast('Save failed: ' + (e.message || e), 'error', 4500);
+  } finally {
+    if (saveBtn) saveBtn.disabled = false;
+  }
+}
+
+/** Reset the form to defaults — re-fetches schema in case it
+ * changed (e.g. a server-side Pydantic update). */
+function bSchemaReset() {
+  if (_bSchemaHandle) { _bSchemaHandle.destroy(); _bSchemaHandle = null; }
+  _bSchemaDescriptor = null;
+  _bSchemaConfig = { model: { type: 'mlp' } };
+  bSchemaRender();
+}
+
 function initBuilder() {
   if (!bWired) {
     bWired = true;
+    // Default the Builder view based on the URL flag — schema if
+    // ?builder=schema is present, else legacy. The toggle buttons
+    // let the user flip live.
+    try {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get('builder') === 'schema') bToggleBuilder('schema');
+    } catch (_) {}
     document.querySelectorAll('#b-mtype-tabs .tab').forEach(t => t.addEventListener('click', () => bSwitchMtype(t.dataset.mtype)));
     if (!document.getElementById('b-mlp-layers').children.length) {
       bAddMlpLayer({ size: 256, activation: 'relu', dropout: 0.2, batch_norm: true });

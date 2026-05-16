@@ -396,7 +396,64 @@ neural init --model transformer --name text_classifier</div>
       <h1 class="page-title">Visual builder</h1>
       <p class="page-sub">Compose a config without YAML. Pick a model family, fill in fields, save & train.</p>
     </div>
+    <div class="row-tight">
+      <!--
+        Toggle between the legacy hand-rolled Builder and the
+        schema-driven form. The schema view reads /api/configs/schema
+        once and dynamically renders every model family — adding a new
+        Pydantic field surfaces without UI changes. The legacy view
+        stays available for one release so users can A/B them.
+      -->
+      <button class="btn btn-ghost btn-xs" id="b-toggle-legacy"
+              onclick="bToggleBuilder('legacy')">Legacy form</button>
+      <button class="btn btn-secondary btn-xs" id="b-toggle-schema"
+              onclick="bToggleBuilder('schema')">Schema-driven (β)</button>
+    </div>
   </div>
+
+  <!--
+    Schema-driven Builder view — hidden by default; the toggle above
+    or ?builder=schema in the URL flips it on. Renders form_builder.js
+    against /api/configs/schema with a live YAML preview pane.
+  -->
+  <div id="b-schema-root" class="hidden">
+    <div class="grid grid-1-2">
+      <div>
+        <div class="card mb-3">
+          <div class="card-head">
+            <div class="card-title">Schema-driven form</div>
+            <div class="row-tight">
+              <button class="btn btn-ghost btn-xs" onclick="bSchemaReset()" title="Re-fetch schema + reset form">Reset</button>
+              <button class="btn btn-primary btn-xs" onclick="bSchemaSave()" id="b-schema-save">Save config</button>
+            </div>
+          </div>
+          <div class="text-xs text-muted mb-3">
+            Every field below is generated from <code>ExperimentConfig.model_json_schema()</code>.
+            Adding a Pydantic field surfaces here automatically — no UI changes needed.
+          </div>
+          <div id="b-schema-host"></div>
+        </div>
+      </div>
+      <div>
+        <div class="card mb-3" style="position:sticky;top:80px">
+          <div class="card-head">
+            <div class="card-title">YAML preview</div>
+            <span class="text-xs text-faint" id="b-schema-yaml-status"></span>
+          </div>
+          <pre id="b-schema-yaml" class="code-block" style="max-height:60vh;overflow:auto;font-size:11px;line-height:1.45"></pre>
+        </div>
+        <div class="card">
+          <div class="card-title mb-2">Validation</div>
+          <div id="b-schema-validation" class="text-xs text-muted">
+            Validation runs on save via <code>/api/configs/validate</code>.
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Legacy hand-rolled Builder — wrapped so we can hide it as a unit. -->
+  <div id="b-legacy-root">
 
   <div class="grid grid-1-2">
     <div>
@@ -671,6 +728,7 @@ neural init --model transformer --name text_classifier</div>
       </div>
     </div>
   </div>
+  </div><!-- /#b-legacy-root -->
 </section>
 
 <!-- ── Experiments ── -->
@@ -1358,6 +1416,7 @@ neural export -c config.yaml --format torchscript</div>
 
 <div class="toasts" id="toasts"></div>
 
+<script src="/static/form_builder.js?v=20260509-1" defer></script>
 <script src="/static/app.js?v=20260430-2" defer></script>
 </body>
 </html>
