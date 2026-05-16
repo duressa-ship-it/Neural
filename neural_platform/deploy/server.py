@@ -913,7 +913,7 @@ def create_inference_app(config: ExperimentConfig,
         from neural_platform.core.pipeline_specs import (
             resolve as _resolve_spec, POSTPROC_GENERATED_TEXT,
             POSTPROC_QA_SPANS, POSTPROC_BOXES, POSTPROC_MASKS, POSTPROC_DEPTH,
-            POSTPROC_TOKEN_LOGITS,
+            POSTPROC_TOKEN_LOGITS, POSTPROC_EMBEDDINGS,
         )
         spec = (_resolve_spec(config.training.pipeline_task)
                 if model_type == "hf_pipeline"
@@ -943,12 +943,21 @@ def create_inference_app(config: ExperimentConfig,
                         # Forward + argmax + tokenizer/processor decode.
                         # The processor's tokenizer half does CTC merge
                         # automatically when called via .batch_decode.
+                        # Route through the wrapper (not encoder) so the
+                        # kwarg-filtering in HFPipelineModel.forward
+                        # picks the right input field — wav2vec2 wants
+                        # `input_values`, Whisper wants `input_features`,
+                        # etc. Bypassing the wrapper triggered an
+                        # AttributeError on wav2vec2-base when
+                        # self.encoder happened to not match the
+                        # spec-resolved auto class.
                         forward_input = (tensor_input
                                           if isinstance(tensor_input, dict)
                                           else {"input_values": tensor_input})
-                        out = encoder(**forward_input)
-                        ctc_logits = (out.logits
-                                       if hasattr(out, "logits") else out)
+                        wrapper_out = model(**forward_input)
+                        ctc_logits = (wrapper_out.logits
+                                       if hasattr(wrapper_out, "logits")
+                                       else wrapper_out)
                         pred_ids = ctc_logits.argmax(dim=-1)
                         text = None
                         if proc is not None:
@@ -1064,6 +1073,13 @@ def create_inference_app(config: ExperimentConfig,
 
         if spec.output_kind == POSTPROC_MASKS and not isinstance(raw_output, torch.Tensor):
             return _masks_response(raw_output, model_type, t0)
+
+        # Embedding-producing tasks (feature-extraction /
+        # sentence-similarity / unknown-task fallback to AutoModel).
+        # The model returns last_hidden_state, not logits — mean-pool
+        # across tokens and ship dim + L2 norm + preview to the UI.
+        if spec.output_kind == POSTPROC_EMBEDDINGS:
+            return _embeddings_response(raw_output, model_type, t0)
 
         # Token classification — per-token labels with character offsets
         # so the UI can highlight spans in the original text. Runs *before*
@@ -1207,10 +1223,48 @@ def _try_load_processor(config: ExperimentConfig):
         if cls is None:
             continue
         try:
-            return cls.from_pretrained(name, **kwargs)
+            loaded = cls.from_pretrained(name, **kwargs)
         except Exception:
             continue
+        # Decoder-only LMs (GPT-2, Llama, Mistral, Qwen, …) don't ship
+        # a pad_token. Calling them via the universal input adapter's
+        # padding="max_length" path then 422s with "Asking to pad but
+        # the tokenizer does not have a padding token." HF's
+        # canonical workaround is to alias pad_token to eos_token —
+        # safe because the model already attends-around the eos token
+        # at generation time. Apply it both to bare tokenizers and to
+        # processors that wrap one.
+        _ensure_pad_token(loaded)
+        return loaded
     return None
+
+
+def _ensure_pad_token(processor) -> None:
+    """Set ``pad_token = eos_token`` when the tokenizer (or the
+    tokenizer half of a processor) lacks a pad token.
+
+    Eliminates the ``Asking to pad but the tokenizer does not have a
+    padding token`` 422 on GPT-2-style decoder-only models. Idempotent
+    — successive calls are no-ops once pad_token is set.
+    """
+    # Tokenizer might be `processor` itself (AutoTokenizer) or live at
+    # `.tokenizer` on a multimodal processor (WhisperProcessor,
+    # BlipProcessor, …).
+    candidates = []
+    if processor is not None:
+        candidates.append(processor)
+    tok = getattr(processor, "tokenizer", None) if processor is not None else None
+    if tok is not None and tok is not processor:
+        candidates.append(tok)
+    for c in candidates:
+        try:
+            if getattr(c, "pad_token", None) is None and getattr(c, "eos_token", None):
+                c.pad_token = c.eos_token
+        except Exception:
+            # Some processors raise on attribute set when they wrap
+            # internal state. Best-effort — skip and let the predict
+            # path handle whatever comes next.
+            pass
 
 
 # Backward-compat alias — older callers / tests still import _try_load_tokenizer.
@@ -1965,8 +2019,11 @@ async def _stream_generation(*, model, processor, tensor_input, request,
                 proc = processor
                 forward_input = (tensor_input if isinstance(tensor_input, dict)
                                   else {"input_values": tensor_input})
+                # Route through the wrapper so kwarg filtering picks the
+                # right input field per model family. See the matching
+                # comment in _do_predict's CTC branch.
                 with torch.no_grad():
-                    out = encoder(**forward_input)
+                    out = model(**forward_input)
                 ctc_logits = out.logits if hasattr(out, "logits") else out
                 pred_ids = ctc_logits.argmax(dim=-1)
                 text = ""
@@ -2639,6 +2696,86 @@ def _depth_response(outputs, model_type: str, t0: float) -> "PredictResponse":
         model_type=model_type,
         latency_ms=round(latency_ms, 2),
         result_kind="depth",
+    )
+
+
+def _embeddings_response(raw_output, model_type: str, t0: float,
+                          ) -> "PredictResponse":
+    """Render an embedding-producing model's output for the Predict UI.
+
+    feature-extraction / sentence-similarity / unknown-task fallback
+    all return ``last_hidden_state`` (per-token embeddings) rather than
+    classification logits. We mean-pool across the sequence axis to
+    produce one document-level embedding, then surface enough metadata
+    for the UI to show it usefully:
+
+      * ``class_name`` — short text summary (dim + L2 norm)
+      * ``metadata.dim`` — embedding dimensionality
+      * ``metadata.l2_norm`` — full-vector norm
+      * ``metadata.preview`` — first 16 dims for a sparkline rendering
+      * ``metadata.stats`` — min / max / mean / std for the sparkline scale
+
+    The full vector isn't shipped back — for a 768-d / 1024-d / 4096-d
+    transformer that's measurable JSON overhead, and the Predict tab's
+    use case is "what does my model think this means" not "give me the
+    raw bytes". A future endpoint can return raw embeddings on demand.
+    """
+    latency_ms = (time.time() - t0) * 1000
+    # Resolve to a tensor without using `or` on the result — that
+    # would trigger Tensor.__bool__ which raises for multi-element
+    # tensors. Walk the fallback chain explicitly.
+    if isinstance(raw_output, torch.Tensor):
+        tensor = raw_output
+    else:
+        tensor = getattr(raw_output, "last_hidden_state", None)
+        if tensor is None:
+            tensor = getattr(raw_output, "logits", None)
+    if tensor is None:
+        return PredictResponse(
+            predictions=[[Prediction(label=0,
+                                       class_name="(no embedding returned)",
+                                       probability=None, score=None)]],
+            model_type=model_type, latency_ms=round(latency_ms, 2),
+            result_kind="embedding",
+        )
+
+    t = tensor.detach().float()
+    # Squeeze leading batch dim if present, then mean-pool over the
+    # sequence axis when shape is (B?, T, D) — leaves a 1-D embedding.
+    while t.dim() > 2 and t.size(0) == 1:
+        t = t.squeeze(0)
+    if t.dim() == 2:
+        t = t.mean(dim=0)   # mean-pool token embeddings → doc embedding
+    elif t.dim() > 2:
+        t = t.flatten()     # last resort
+
+    dim = int(t.numel())
+    l2 = float(torch.linalg.vector_norm(t).item())
+    preview_n = min(16, dim)
+    preview = [round(float(x), 6) for x in t[:preview_n].tolist()]
+    stats = {
+        "min":  round(float(t.min()), 6),
+        "max":  round(float(t.max()), 6),
+        "mean": round(float(t.mean()), 6),
+        "std":  round(float(t.std()) if dim > 1 else 0.0, 6),
+    }
+
+    return PredictResponse(
+        predictions=[[Prediction(
+            label=0,
+            class_name=f"embedding · {dim}-d · ‖v‖₂ = {l2:.3f}",
+            probability=None,
+            score=round(l2, 6),
+            metadata={
+                "dim":     dim,
+                "l2_norm": round(l2, 6),
+                "preview": preview,
+                "stats":   stats,
+            },
+        )]],
+        model_type=model_type,
+        latency_ms=round(latency_ms, 2),
+        result_kind="embedding",
     )
 
 

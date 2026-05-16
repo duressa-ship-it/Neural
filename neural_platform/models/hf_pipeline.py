@@ -298,6 +298,22 @@ class HFPipelineModel(BaseModel):
         dropped, so e.g. ``token_type_ids`` getting passed to a Whisper
         backbone won't blow up.
         """
+        # Defensive: a wrapper instance that's missing `self.encoder`
+        # means from_pretrained either silently returned something
+        # falsy, or the attribute got clobbered. Surface a clear
+        # error instead of the cryptic "'HFPipelineModel' object has
+        # no attribute 'encoder'" — the bug-1 user saw this against
+        # wav2vec2-base.
+        if not hasattr(self, "encoder") or self.encoder is None:
+            raise RuntimeError(
+                "HFPipelineModel.forward called but the underlying HF "
+                "model is not attached. This usually means the "
+                "auto-class chain resolved a class incompatible with "
+                "this checkpoint (e.g. AutoModelForSpeechSeq2Seq on a "
+                "CTC model). Confirm pipeline_task matches the model's "
+                "actual head — wav2vec2 / hubert / MMS are CTC, while "
+                "Whisper / SeamlessM4T are Seq2Seq."
+            )
         # Filter kwargs against the HF model's own forward signature.
         if kwargs:
             kwargs = self._filter_kwargs(kwargs)

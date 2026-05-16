@@ -3668,8 +3668,59 @@ function pgRenderResults(res) {
     case 'qa_spans':      _pgRenderQA(preds);                break;
     case 'generated_text':_pgRenderGeneratedText(preds);     break;
     case 'token_spans':   _pgRenderTokenSpans(preds);        break;
+    case 'embedding':     _pgRenderEmbedding(preds);         break;
     default:              _pgRenderLogitsBars(preds);
   }
+}
+
+/**
+ * Embedding renderer — feature-extraction / sentence-similarity /
+ * any model whose pipeline_task resolves to the AutoModel fallback.
+ * The server already pooled across tokens and shipped dim + L2 +
+ * preview, so we render a small "info card" with a sparkline of the
+ * first N dims. Full vector isn't on the wire — for now it's a
+ * preview + stats; if users want the raw bytes we can add a
+ * /predict/embed endpoint later.
+ */
+function _pgRenderEmbedding(preds) {
+  const host = document.getElementById('pg-rich-text');
+  host.classList.remove('hidden');
+  const p = preds[0] || {};
+  const md = p.metadata || {};
+  const dim = md.dim;
+  const preview = md.preview || [];
+  const stats = md.stats || {};
+  // Render a small SVG sparkline of the first N dims. Scaling: map
+  // [stats.min, stats.max] to the vertical extent of the chart.
+  const W = 360, H = 60, pad = 4;
+  const lo = stats.min ?? Math.min(...preview, 0);
+  const hi = stats.max ?? Math.max(...preview, 1);
+  const span = (hi - lo) || 1;
+  const pts = preview.map((v, i) => {
+    const x = pad + (preview.length <= 1 ? 0 :
+                      (i / (preview.length - 1)) * (W - 2 * pad));
+    const y = H - pad - ((v - lo) / span) * (H - 2 * pad);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+  const zeroY = H - pad - ((0 - lo) / span) * (H - 2 * pad);
+  host.innerHTML = `
+    <div class="text-xs text-muted mb-2" style="text-transform:uppercase;letter-spacing:0.06em">Embedding vector</div>
+    <div class="row-tight mb-2" style="gap:14px">
+      <span class="text-mono"><strong>${dim ?? '—'}</strong>-dim</span>
+      <span class="text-mono">‖v‖₂ = ${md.l2_norm != null ? Number(md.l2_norm).toFixed(4) : '—'}</span>
+      <span class="text-faint text-xs">min ${stats.min ?? '—'} · max ${stats.max ?? '—'} · μ ${stats.mean ?? '—'} · σ ${stats.std ?? '—'}</span>
+    </div>
+    <svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px;height:${H}px;background:var(--bg-elev);border:1px solid var(--border);border-radius:6px">
+      <line x1="0" y1="${zeroY}" x2="${W}" y2="${zeroY}" stroke="var(--border)" stroke-dasharray="2 3" />
+      <polyline points="${pts}" fill="none" stroke="var(--accent, #22d3ee)" stroke-width="1.5" />
+      ${preview.map((v, i) => {
+        const x = pad + (preview.length <= 1 ? 0 :
+                          (i / (preview.length - 1)) * (W - 2 * pad));
+        const y = H - pad - ((v - lo) / span) * (H - 2 * pad);
+        return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2" fill="var(--accent, #22d3ee)" />`;
+      }).join('')}
+    </svg>
+    <div class="text-xs text-faint mt-2">Showing first ${preview.length} dim(s). Full vector not in response — use a downstream endpoint for raw embeddings.</div>`;
 }
 
 /* ----- renderers — one per result_kind ----- */

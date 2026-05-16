@@ -2106,6 +2106,20 @@ def create_dashboard_app(output_dir: str = "runs") -> FastAPI:
         """Scan output_dir and return metadata for every config.yaml found."""
         return _scan_configs(output_dir)
 
+    @app.get("/api/configs/schema", tags=["Configs"],
+             summary="Schema-driven Builder form descriptor")
+    async def configs_schema():
+        """Return ``flatten_for_ui(ExperimentConfig.model_json_schema())``.
+
+        The Builder tab reads this once on tab-load and renders its form
+        dynamically — adding a new model family becomes a Pydantic-only
+        change. Output shape is documented in
+        :mod:`neural_platform.core.config_introspect`.
+        """
+        from neural_platform.core.config import ExperimentConfig
+        from neural_platform.core.config_introspect import flatten_for_ui
+        return flatten_for_ui(ExperimentConfig.model_json_schema())
+
     @app.get("/api/configs/load", tags=["Configs"], summary="Load a config as JSON")
     async def load_config(path: str):
         p = _validated_config_path(path)

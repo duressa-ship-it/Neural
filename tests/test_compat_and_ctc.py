@@ -296,6 +296,14 @@ class TestCtcPredictRouting:
             def __init__(self):
                 super().__init__()
                 self.encoder = _Enc()
+            # The CTC predict path now routes through the wrapper
+            # (model(**inputs)) so kwarg-filtering picks the right
+            # input field per model family. Delegate to .encoder so
+            # this stub matches what HFPipelineModel does for real.
+            def forward(self, *args, **kwargs):
+                if kwargs:
+                    return self.encoder(**kwargs)
+                return self.encoder(*args)
             def count_parameters(self, trainable_only=False): return 0
 
         # Processor: tokenizes raw audio + has batch_decode. We force
