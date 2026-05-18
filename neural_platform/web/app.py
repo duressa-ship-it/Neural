@@ -67,6 +67,16 @@ class ProxyPredictRequest(BaseModel):
     attention_mask: Optional[Any] = None
     image_b64: Optional[str] = None
     text: Optional[str] = None
+    # v0.4.x fields — were silently stripped by Pydantic before this fix.
+    context: Optional[str] = None
+    candidate_labels: Optional[List[str]] = None
+    audio_b64: Optional[str] = None
+    video_b64: Optional[str] = None
+    file_mime: Optional[str] = None
+    max_new_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    do_sample: Optional[bool] = None
+    messages: Optional[List[Dict[str, Any]]] = None
     top_k: int = 5
     return_probabilities: bool = True
     # Optional bearer token to forward to the inference server. Kept in the
@@ -2534,11 +2544,20 @@ def create_dashboard_app(output_dir: str = "runs") -> FastAPI:
             "top_k": req.top_k,
             "return_probabilities": req.return_probabilities,
         }
-        if req.inputs         is not None: payload["inputs"]         = req.inputs
-        if req.tokens         is not None: payload["tokens"]         = req.tokens
-        if req.attention_mask is not None: payload["attention_mask"] = req.attention_mask
-        if req.image_b64      is not None: payload["image_b64"]      = req.image_b64
-        if req.text           is not None: payload["text"]           = req.text
+        if req.inputs            is not None: payload["inputs"]            = req.inputs
+        if req.tokens            is not None: payload["tokens"]            = req.tokens
+        if req.attention_mask    is not None: payload["attention_mask"]    = req.attention_mask
+        if req.image_b64         is not None: payload["image_b64"]         = req.image_b64
+        if req.text              is not None: payload["text"]              = req.text
+        if req.context           is not None: payload["context"]           = req.context
+        if req.candidate_labels  is not None: payload["candidate_labels"]  = req.candidate_labels
+        if req.audio_b64         is not None: payload["audio_b64"]         = req.audio_b64
+        if req.video_b64         is not None: payload["video_b64"]         = req.video_b64
+        if req.file_mime         is not None: payload["file_mime"]         = req.file_mime
+        if req.max_new_tokens    is not None: payload["max_new_tokens"]    = req.max_new_tokens
+        if req.temperature       is not None: payload["temperature"]       = req.temperature
+        if req.do_sample         is not None: payload["do_sample"]         = req.do_sample
+        if req.messages          is not None: payload["messages"]          = req.messages
 
         # Prefer the Authorization header (most secure — never in logs/URLs).
         # Fall back to `bearer_token` in the request body for clients that
@@ -2569,6 +2588,80 @@ def create_dashboard_app(output_dir: str = "runs") -> FastAPI:
             raise HTTPException(e.response.status_code, detail)
         except Exception as e:
             raise HTTPException(503, f"Inference server error: {e}")
+
+    @app.post("/api/proxy/predict/stream", tags=["Inference"],
+              summary="Stream tokens from an external inference server (CORS-safe SSE proxy)")
+    async def proxy_predict_stream(req: ProxyPredictRequest,
+                                   request: Request,
+                                   authorization: Optional[str] = Header(default=None)):
+        """SSE proxy for external (non-managed) generative inference servers.
+
+        The browser posts the same body it would send to ``/api/proxy/predict``
+        but for streaming tasks. We open an httpx streaming connection to the
+        external server's ``/predict/stream`` endpoint (attaching the bearer
+        token server-side so it never travels through the browser network log),
+        then forward the raw SSE bytes back.  This mirrors what
+        ``/api/inference/{id}/predict/stream`` does for managed servers.
+        """
+        import httpx
+        from fastapi.responses import StreamingResponse as _SSE
+
+        base = _validated_proxy_base_url(req.server_url)
+        # Build forwarded payload — same field list as proxy_predict.
+        payload: Dict[str, Any] = {
+            "top_k": req.top_k,
+            "return_probabilities": req.return_probabilities,
+        }
+        if req.inputs            is not None: payload["inputs"]            = req.inputs
+        if req.tokens            is not None: payload["tokens"]            = req.tokens
+        if req.attention_mask    is not None: payload["attention_mask"]    = req.attention_mask
+        if req.image_b64         is not None: payload["image_b64"]         = req.image_b64
+        if req.text              is not None: payload["text"]              = req.text
+        if req.context           is not None: payload["context"]           = req.context
+        if req.candidate_labels  is not None: payload["candidate_labels"]  = req.candidate_labels
+        if req.audio_b64         is not None: payload["audio_b64"]         = req.audio_b64
+        if req.video_b64         is not None: payload["video_b64"]         = req.video_b64
+        if req.file_mime         is not None: payload["file_mime"]         = req.file_mime
+        if req.max_new_tokens    is not None: payload["max_new_tokens"]    = req.max_new_tokens
+        if req.temperature       is not None: payload["temperature"]       = req.temperature
+        if req.do_sample         is not None: payload["do_sample"]         = req.do_sample
+        if req.messages          is not None: payload["messages"]          = req.messages
+
+        outbound_headers = _proxy_bearer_headers(authorization)
+        if not outbound_headers and req.bearer_token:
+            outbound_headers = {"Authorization": f"Bearer {req.bearer_token}"}
+        outbound_headers["Accept"] = "text/event-stream"
+
+        url = f"{base}/predict/stream"
+
+        async def relay():
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, read=120.0)) as client:
+                    async with client.stream("POST", url, json=payload,
+                                             headers=outbound_headers) as r:
+                        if r.status_code == 401:
+                            yield (b'event: error\ndata: {"detail": "Inference server requires '
+                                   b'a bearer token."}\n\n')
+                            return
+                        if r.status_code != 200:
+                            err = await r.aread()
+                            yield (f'event: error\ndata: {{"detail": "Upstream {r.status_code}: '
+                                   f'{err[:200].decode(\"utf-8\", \"replace\")}"}}\n\n').encode()
+                            return
+                        async for chunk in r.aiter_bytes(4096):
+                            if await request.is_disconnected():
+                                break
+                            yield chunk
+            except httpx.ConnectError as exc:
+                yield f'event: error\ndata: {{"detail": "Cannot reach server: {exc}"}}\n\n'.encode()
+            except Exception as exc:
+                yield f'event: error\ndata: {{"detail": "Proxy stream error: {exc}"}}\n\n'.encode()
+
+        return _SSE(relay(), media_type="text/event-stream", headers={
+            "Cache-Control":    "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection":       "keep-alive",
+        })
 
     # ------------------------------------------------------------------
     # Live training SSE

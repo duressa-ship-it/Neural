@@ -2341,8 +2341,6 @@ function ckOpen(idx) {
 let pgType = null, pgImageB64 = null, pgLastReq = null, pgLastRes = null, pgJsonOpen = false;
 
 function initPredict() {
-  const grid = document.getElementById('pg-mlp-grid');
-  if (!grid.children.length) { for (let i = 0; i < 8; i++) pgAddMlpField(0); }
   initPredictLatencyChart();
   ifRefresh();
 }
@@ -2670,7 +2668,12 @@ async function pgConnect() {
     // Drive the universal input panel from the server's spec hint.
     // /info now carries a ui_hint dict per the connected model's task —
     // we toggle visibility instead of switching across hardcoded panels.
-    pgApplyHint(info.ui_hint || _pgFallbackHintFor(info.model_type));
+    _pgServerHint = info.ui_hint || _pgFallbackHintFor(info.model_type);
+    pgApplyHint(_pgServerHint);
+    // A new connection always starts in auto-detect mode — clear any
+    // force-override the user had selected from a prior session.
+    const _typeOverrideEl = document.getElementById('pg-type-override');
+    if (_typeOverrideEl) _typeOverrideEl.value = '';
     // Chat surface — visible whenever the loaded tokenizer ships a
     // chat_template. Replaces the universal input panel for these
     // models since multi-turn is the natural way to use them.
@@ -2944,7 +2947,8 @@ function pgHandleFile(file) {
 }
 
 // Module-level state for the universal input panel.
-let _pgHint     = null;   // last hint object applied (drives pgRun's payload assembly)
+let _pgHint       = null;   // last hint object applied (drives pgRun's payload assembly)
+let _pgServerHint = null;   // hint returned by /info on last connect — used to restore auto-detect
 let _pgAudioB64 = null;   // base64 of a dropped audio file
 let _pgVideoB64 = null;   // base64 of a dropped video file
 let _pgFileMime = null;   // MIME hint forwarded with the b64 field
@@ -2960,7 +2964,55 @@ let _pgChatActive = false;
 
 // Legacy MLP grid helpers — kept as no-ops so any cached HTML calling
 // them doesn't throw. The new universal panel doesn't render the grid.
-function pgSetType(type) { /* noop — see pgApplyHint */ }
+
+// Synthetic hint objects for "Force input type" dropdown overrides.
+// Each entry drives pgApplyHint exactly as a server /info ui_hint would.
+const _OVERRIDE_HINTS = {
+  mlp:        { primary_field: 'inputs',    show_text: false, show_file: false,
+                show_generation_knobs: false,
+                summary: 'Override: MLP / Tabular — supply raw feature vector in the Inputs field' },
+  cnn:        { primary_field: 'image_b64', show_text: false, show_file: true,
+                show_generation_knobs: false,
+                accept: 'image/*', file_placeholder: 'Drop an image',
+                summary: 'Override: CNN / Image' },
+  rnn:        { primary_field: 'inputs',    show_text: true,  show_file: false,
+                show_generation_knobs: false,
+                text_placeholder: 'Comma-separated sequence values',
+                summary: 'Override: RNN / Sequence' },
+  transformer:{ primary_field: 'text',      show_text: true,  show_file: false,
+                show_generation_knobs: false,
+                text_placeholder: 'Input text',
+                summary: 'Override: Transformer / Text' },
+  audio_cnn:  { primary_field: 'audio_b64', show_text: false, show_file: true,
+                show_generation_knobs: false,
+                accept: 'audio/*', file_placeholder: 'Drop an audio file',
+                summary: 'Override: Audio CNN' },
+  tcn:        { primary_field: 'inputs',    show_text: true,  show_file: false,
+                show_generation_knobs: false,
+                text_placeholder: 'Comma-separated sequence values',
+                summary: 'Override: TCN / Sequence' },
+  tabular:    { primary_field: 'inputs',    show_text: false, show_file: false,
+                show_generation_knobs: false,
+                summary: 'Override: Tabular (named features) — supply raw inputs JSON' },
+  video_cnn:  { primary_field: 'video_b64', show_text: false, show_file: true,
+                show_generation_knobs: false,
+                accept: 'video/*', file_placeholder: 'Drop a video file',
+                summary: 'Override: Video CNN' },
+  hf_pipeline:{ primary_field: 'text',      show_text: true,  show_file: false,
+                show_generation_knobs: true,
+                text_placeholder: 'Input text',
+                summary: 'Override: HF Pipeline (universal)' },
+};
+
+function pgSetType(type) {
+  if (!type) {
+    // '' = Auto-detect: restore whatever the last pgConnect() returned.
+    if (_pgServerHint) pgApplyHint(_pgServerHint);
+    return;
+  }
+  const override = _OVERRIDE_HINTS[type];
+  if (override) pgApplyHint(override);
+}
 function pgAddMlpField(val) { /* noop */ }
 function pgRandomFill()    { /* noop */ }
 function pgClearFields()   { /* noop */ }
@@ -3158,14 +3210,15 @@ async function pgRunStream({ payload, url, managedId, btn }) {
       signal:  _pgStreamCtl.signal,
     };
   } else {
-    // External-server streaming requires the inference server's
-    // /predict/stream — we don't go through /api/proxy/predict for SSE.
-    // Strip the trailing slash, prepend bearer if present.
-    const headers = { 'Content-Type': 'application/json',
-                       'Accept': 'text/event-stream', ..._pgAuthHeaders() };
-    endpoint = url.replace(/\/+$/, '') + '/predict/stream';
-    init = { method: 'POST', headers, body: JSON.stringify(payload),
-             signal: _pgStreamCtl.signal };
+    // External-server streaming routes through the dashboard's SSE proxy
+    // so the bearer token stays server-side and CORS is not an issue.
+    endpoint = '/api/proxy/predict/stream';
+    init = {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
+      body:    JSON.stringify(payload),   // payload already contains server_url
+      signal:  _pgStreamCtl.signal,
+    };
   }
 
   let resp;
@@ -3513,13 +3566,14 @@ async function pgChatSend() {
       signal: _pgStreamCtl.signal,
     };
   } else {
-    endpoint = url.replace(/\/+$/, '') + '/predict/stream';
+    // Route through the dashboard's SSE proxy — keeps the bearer token
+    // server-side and avoids CORS issues with external inference servers.
+    endpoint = '/api/proxy/predict/stream';
     init = {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json',
-                  'Accept': 'text/event-stream', ..._pgAuthHeaders() },
-      body: JSON.stringify(payload),
-      signal: _pgStreamCtl.signal,
+      headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
+      body:    JSON.stringify(payload),   // payload already contains server_url
+      signal:  _pgStreamCtl.signal,
     };
   }
 
